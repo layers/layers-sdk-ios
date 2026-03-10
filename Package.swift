@@ -18,6 +18,10 @@ let package = Package(
             name: "Layers",
             targets: ["Layers"]
         ),
+        .library(
+            name: "LayersTesting",
+            targets: ["LayersTesting"]
+        ),
     ],
     dependencies: [],
     targets: [
@@ -29,7 +33,15 @@ let package = Package(
         .target(
             name: "Layers",
             dependencies: ["LayersCoreFFI"],
-            path: "Sources/Layers"
+            path: "Sources/Layers",
+            resources: [
+                .process("PrivacyInfo.xcprivacy"),
+            ]
+        ),
+        .target(
+            name: "LayersTesting",
+            dependencies: ["Layers"],
+            path: "Sources/LayersTesting"
         ),
     ]
 )
