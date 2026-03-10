@@ -1,0 +1,5 @@
+framework module LayersCoreFFI {
+    header "LayersCoreFFI.h"
+    link "layers_core"
+    export *
+}

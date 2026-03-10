@@ -1,0 +1,4 @@
+module LayersCoreFFI {
+    header "LayersCoreFFI.h"
+    export *
+}
