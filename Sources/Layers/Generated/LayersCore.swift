@@ -979,7 +979,7 @@ public func FfiConverterTypeLayersCoreHandle_lower(_ value: LayersCoreHandle) ->
  */
 public struct UniFfiConfig {
     public let appId: String
-    public let environment: UniFfiEnvironment
+    public let environment: LayersEnvironment
     public let baseUrl: String?
     public let flushIntervalMs: UInt64?
     public let flushThreshold: UInt32?
@@ -994,7 +994,7 @@ public struct UniFfiConfig {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(appId: String, environment: UniFfiEnvironment, baseUrl: String?, flushIntervalMs: UInt64?, flushThreshold: UInt32?, maxQueueSize: UInt32?, maxBatchSize: UInt32?, enableDebug: Bool?, sdkVersion: String?,
+    public init(appId: String, environment: LayersEnvironment, baseUrl: String?, flushIntervalMs: UInt64?, flushThreshold: UInt32?, maxQueueSize: UInt32?, maxBatchSize: UInt32?, enableDebug: Bool?, sdkVersion: String?,
                 /**
                     * Directory for file-based event persistence.
                     */ persistenceDir: String?)
@@ -1069,7 +1069,7 @@ public struct FfiConverterTypeUniFFIConfig: FfiConverterRustBuffer {
         return
             try UniFfiConfig(
                 appId: FfiConverterString.read(from: &buf),
-                environment: FfiConverterTypeUniFFIEnvironment.read(from: &buf),
+                environment: FfiConverterTypeLayersEnvironment.read(from: &buf),
                 baseUrl: FfiConverterOptionString.read(from: &buf),
                 flushIntervalMs: FfiConverterOptionUInt64.read(from: &buf),
                 flushThreshold: FfiConverterOptionUInt32.read(from: &buf),
@@ -1083,7 +1083,7 @@ public struct FfiConverterTypeUniFFIConfig: FfiConverterRustBuffer {
 
     public static func write(_ value: UniFfiConfig, into buf: inout [UInt8]) {
         FfiConverterString.write(value.appId, into: &buf)
-        FfiConverterTypeUniFFIEnvironment.write(value.environment, into: &buf)
+        FfiConverterTypeLayersEnvironment.write(value.environment, into: &buf)
         FfiConverterOptionString.write(value.baseUrl, into: &buf)
         FfiConverterOptionUInt64.write(value.flushIntervalMs, into: &buf)
         FfiConverterOptionUInt32.write(value.flushThreshold, into: &buf)
@@ -1321,9 +1321,10 @@ public func FfiConverterTypeUniFFIDeviceContext_lower(_ value: UniFfiDeviceConte
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
  * Runtime environment — re-exported for UniFFI.
+ * Named LayersEnvironment (not Environment) to avoid collision with SwiftUI's @Environment.
  */
 
-public enum UniFfiEnvironment {
+public enum LayersEnvironment {
     case development
     case staging
     case production
@@ -1332,10 +1333,10 @@ public enum UniFfiEnvironment {
 #if swift(>=5.8)
     @_documentation(visibility: private)
 #endif
-public struct FfiConverterTypeUniFFIEnvironment: FfiConverterRustBuffer {
-    typealias SwiftType = UniFfiEnvironment
+public struct FfiConverterTypeLayersEnvironment: FfiConverterRustBuffer {
+    typealias SwiftType = LayersEnvironment
 
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UniFfiEnvironment {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> LayersEnvironment {
         let variant: Int32 = try readInt(&buf)
         switch variant {
         case 1: return .development
@@ -1348,7 +1349,7 @@ public struct FfiConverterTypeUniFFIEnvironment: FfiConverterRustBuffer {
         }
     }
 
-    public static func write(_ value: UniFfiEnvironment, into buf: inout [UInt8]) {
+    public static func write(_ value: LayersEnvironment, into buf: inout [UInt8]) {
         switch value {
         case .development:
             writeInt(&buf, Int32(1))
@@ -1365,18 +1366,18 @@ public struct FfiConverterTypeUniFFIEnvironment: FfiConverterRustBuffer {
 #if swift(>=5.8)
     @_documentation(visibility: private)
 #endif
-public func FfiConverterTypeUniFFIEnvironment_lift(_ buf: RustBuffer) throws -> UniFfiEnvironment {
-    return try FfiConverterTypeUniFFIEnvironment.lift(buf)
+public func FfiConverterTypeLayersEnvironment_lift(_ buf: RustBuffer) throws -> LayersEnvironment {
+    return try FfiConverterTypeLayersEnvironment.lift(buf)
 }
 
 #if swift(>=5.8)
     @_documentation(visibility: private)
 #endif
-public func FfiConverterTypeUniFFIEnvironment_lower(_ value: UniFfiEnvironment) -> RustBuffer {
-    return FfiConverterTypeUniFFIEnvironment.lower(value)
+public func FfiConverterTypeLayersEnvironment_lower(_ value: LayersEnvironment) -> RustBuffer {
+    return FfiConverterTypeLayersEnvironment.lower(value)
 }
 
-extension UniFfiEnvironment: Equatable, Hashable {}
+extension LayersEnvironment: Equatable, Hashable {}
 
 /**
  * Error type exported via UniFFI. Maps 1:1 to internal `LayersError`.
@@ -1553,6 +1554,7 @@ public enum UniFfiPlatform {
     case node
     case flutter
     case macos
+    case unity
 }
 
 #if swift(>=5.8)
@@ -1577,6 +1579,8 @@ public struct FfiConverterTypeUniFFIPlatform: FfiConverterRustBuffer {
         case 6: return .flutter
 
         case 7: return .macos
+
+        case 8: return .unity
 
         default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -1604,6 +1608,9 @@ public struct FfiConverterTypeUniFFIPlatform: FfiConverterRustBuffer {
 
         case .macos:
             writeInt(&buf, Int32(7))
+
+        case .unity:
+            writeInt(&buf, Int32(8))
         }
     }
 }

@@ -66,17 +66,14 @@ typealias CoreError = LayersError
 
 // MARK: - Environment
 
-public enum Environment: String, Sendable {
-    case development
-    case staging
-    case production
-}
+// LayersEnvironment is defined in Generated/LayersCore.swift (UniFFI-generated).
+// Named LayersEnvironment (not Environment) to avoid collision with SwiftUI's @Environment.
 
 // MARK: - LayersConfig
 
 public struct LayersConfig: Sendable {
     public let appId: String
-    public let environment: Environment
+    public let environment: LayersEnvironment
     public let enableDebug: Bool
     public let flushQueueSize: UInt32
     public let flushIntervalSecs: UInt32
@@ -89,7 +86,7 @@ public struct LayersConfig: Sendable {
 
     public init(
         appId: String,
-        environment: Environment = .production,
+        environment: LayersEnvironment = .production,
         enableDebug: Bool = false,
         flushQueueSize: UInt32 = 20,
         flushIntervalSecs: UInt32 = 30,
@@ -225,16 +222,9 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
         }
 
         let persistencePath = Self.persistenceDirectory()
-        let uniffiEnv: UniFfiEnvironment
-        switch config.environment {
-        case .development: uniffiEnv = .development
-        case .staging: uniffiEnv = .staging
-        case .production: uniffiEnv = .production
-        }
-
         let uniffiConfig = UniFfiConfig(
             appId: config.appId,
-            environment: uniffiEnv,
+            environment: config.environment,
             baseUrl: config.baseUrl,
             flushIntervalMs: UInt64(config.flushIntervalSecs) * 1000,
             flushThreshold: config.flushQueueSize,
