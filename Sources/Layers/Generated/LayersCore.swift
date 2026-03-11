@@ -522,6 +522,14 @@ public protocol LayersCoreHandleProtocol: AnyObject {
     func configEtag() throws -> String?
 
     /**
+     * Return the HTTP headers for a config GET request as a JSON string.
+     * Includes X-App-Id, X-Environment, X-SDK-Version, and If-None-Match
+     * (if an ETag is cached). The JSON format is an array of [key, value] pairs,
+     * e.g.: `[["Accept","application/json"],["X-App-Id","my_app"]]`
+     */
+    func configHeadersJson() throws -> String
+
+    /**
      * Return the full URL for the remote config endpoint.
      */
     func configUrl() throws -> String
@@ -712,6 +720,18 @@ open class LayersCoreHandle:
     open func configEtag() throws -> String? {
         return try FfiConverterOptionString.lift(rustCallWithError(FfiConverterTypeUniFFIError.lift) {
             uniffi_layers_core_fn_method_layerscorehandle_config_etag(self.uniffiClonePointer(), $0)
+        })
+    }
+
+    /**
+     * Return the HTTP headers for a config GET request as a JSON string.
+     * Includes X-App-Id, X-Environment, X-SDK-Version, and If-None-Match
+     * (if an ETag is cached). The JSON format is an array of [key, value] pairs,
+     * e.g.: `[["Accept","application/json"],["X-App-Id","my_app"]]`
+     */
+    open func configHeadersJson() throws -> String {
+        return try FfiConverterString.lift(rustCallWithError(FfiConverterTypeUniFFIError.lift) {
+            uniffi_layers_core_fn_method_layerscorehandle_config_headers_json(self.uniffiClonePointer(), $0)
         })
     }
 
@@ -1768,6 +1788,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.contractVersionMismatch
     }
     if uniffi_layers_core_checksum_method_layerscorehandle_config_etag() != 32954 {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if uniffi_layers_core_checksum_method_layerscorehandle_config_headers_json() != 37167 {
         return InitializationResult.apiChecksumMismatch
     }
     if uniffi_layers_core_checksum_method_layerscorehandle_config_url() != 19268 {

@@ -2,8 +2,8 @@
 
 import PackageDescription
 
-let version = "1.4.4"
-let checksum = "f86a25a3d2cedaf711afc760f9454da052f4ad84e7619cae592c1f5b542f1c36"
+let version = "1.4.5"
+let checksum = "0e80426e8a6b1861f037e3a799be5ff8e79c3ea9981f271650d31db43ec037d6"
 
 let package = Package(
     name: "Layers",

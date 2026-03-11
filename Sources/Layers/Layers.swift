@@ -157,6 +157,8 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
     /// NWPathMonitor for flush-on-reconnect.
     private var _networkMonitor: NWPathMonitor?
     private let _monitorQueue = DispatchQueue(label: "io.layers.sdk.network-monitor")
+    /// Serial queue for HTTP event delivery (drain → send → retry/requeue).
+    private let _flushQueue = DispatchQueue(label: "io.layers.sdk.flush")
     /// Tracks previous offline state for flush-on-reconnect. Only accessed on `_monitorQueue`.
     private var _wasOffline = false
 
@@ -164,8 +166,6 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
     private var _configTimer: DispatchSourceTimer?
     /// Timer for periodic auto-flush at the configured interval.
     private var _flushTimer: DispatchSourceTimer?
-    /// Guard to prevent overlapping flush calls from the timer.
-    private var _isFlushing = false
     /// Config poll interval in seconds.
     private static let configPollIntervalSecs: UInt32 = 300
 
@@ -566,8 +566,14 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
 
     // MARK: - Flush & Reset
 
+    /// Maximum number of retry attempts for a single batch delivery.
+    private static let maxRetries = 3
+    /// Default batch size for drain operations.
+    private static let defaultBatchSize: UInt32 = 1000
+
     /// Flush queued events to the server (async version — preferred).
-    /// Runs the synchronous flush on a background thread to avoid blocking.
+    /// Drains events from the Rust core queue, sends them over HTTP via URLSession,
+    /// retries on transient failures, and requeues events if all retries are exhausted.
     public func flush() async -> SafeResult<Void> {
         guard let core = lockedCoreIfInitialized() else {
             let err = LayersError.notInitialized
@@ -578,15 +584,13 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
             os_log("flush()", log: Self.log, type: .debug)
         }
         return await withCheckedContinuation { continuation in
-            DispatchQueue.global(qos: .utility).async { [weak self] in
-                do {
-                    try core.flush()
+            _flushQueue.async { [weak self] in
+                guard let self = self else {
                     continuation.resume(returning: .success(()))
-                } catch {
-                    let mapped = Self.mapError(error)
-                    self?.reportError(method: "flush", error: mapped)
-                    continuation.resume(returning: .failure(mapped))
+                    return
                 }
+                let result = self.deliverBatch(core: core)
+                continuation.resume(returning: result)
             }
         }
     }
@@ -602,14 +606,144 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
             reportError(method: "flushBlocking", error: err)
             return .failure(err)
         }
+        let semaphore = DispatchSemaphore(value: 0)
+        let box = ResultBox<SafeResult<Void>>(.success(()))
+        _flushQueue.async { [weak self] in
+            guard let self = self else {
+                semaphore.signal()
+                return
+            }
+            box.value = self.deliverBatch(core: core)
+            semaphore.signal()
+        }
+        // Cap at 45s (3 retries × 10s timeout + backoff)
+        let result = semaphore.wait(timeout: .now() + 45)
+        if result == .timedOut {
+            os_log("flushBlocking timed out after 45s", log: Self.log, type: .error)
+            return .failure(LayersError.networkError("flushBlocking timed out"))
+        }
+        return box.value
+    }
+
+    /// Core drain-and-deliver loop. Must be called on `_flushQueue` (serial).
+    /// The serial queue guarantees mutual exclusion — no additional lock needed.
+    /// Drains a batch from the Rust queue, sends via URLSession with retry,
+    /// and requeues events on exhausted retries.
+    private func deliverBatch(core: LayersCoreHandle) -> SafeResult<Void> {
+        // Drain a batch from the Rust queue
+        let batchJson: String
         do {
-            try core.flush()
-            return .success(())
+            guard let json = try core.drainBatch(count: Self.defaultBatchSize) else {
+                return .success(()) // Queue empty
+            }
+            batchJson = json
         } catch {
             let mapped = Self.mapError(error)
-            reportError(method: "flushBlocking", error: mapped)
+            reportError(method: "flush", error: mapped)
             return .failure(mapped)
         }
+
+        // Get URL and headers from the Rust core
+        let urlString: String
+        let headersJson: String
+        do {
+            urlString = try core.eventsUrl()
+            headersJson = try core.flushHeadersJson()
+        } catch {
+            // Cannot deliver without URL/headers — requeue events
+            requeueSilently(core: core, batchJson: batchJson)
+            let mapped = Self.mapError(error)
+            reportError(method: "flush", error: mapped)
+            return .failure(mapped)
+        }
+
+        guard let url = URL(string: urlString) else {
+            requeueSilently(core: core, batchJson: batchJson)
+            let err = LayersError.networkError("Invalid events URL: \(urlString)")
+            reportError(method: "flush", error: err)
+            return .failure(err)
+        }
+
+        // Build URLRequest with headers from Rust core
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 10
+        request.httpBody = batchJson.data(using: .utf8)
+        guard Self.applyHeaders(from: headersJson, to: &request) else {
+            requeueSilently(core: core, batchJson: batchJson)
+            let err = LayersError.networkError("Failed to parse flush headers")
+            reportError(method: "flush", error: err)
+            return .failure(err)
+        }
+
+        // Retry loop with exponential backoff + jitter
+        for attempt in 0..<Self.maxRetries {
+            let semaphore = DispatchSemaphore(value: 0)
+            var responseStatus: Int?
+            var networkError: Error?
+
+            let task = URLSession.shared.dataTask(with: request) { _, response, error in
+                networkError = error
+                responseStatus = (response as? HTTPURLResponse)?.statusCode
+                semaphore.signal()
+            }
+            task.resume()
+            semaphore.wait()
+
+            if let error = networkError {
+                os_log("Flush attempt %d failed (network): %{public}@", log: Self.log, type: .error, attempt + 1, error.localizedDescription)
+                if attempt < Self.maxRetries - 1 {
+                    Thread.sleep(forTimeInterval: Self.retryDelay(attempt: attempt))
+                    continue
+                }
+            } else if let status = responseStatus {
+                if status >= 200 && status < 300 {
+                    if enableDebug {
+                        os_log("Flush succeeded (HTTP %d)", log: Self.log, type: .debug, status)
+                    }
+                    return .success(())
+                }
+
+                if status == 429 || status >= 500 {
+                    // Retryable
+                    os_log("Flush attempt %d: HTTP %d (retryable)", log: Self.log, type: .error, attempt + 1, status)
+                    if attempt < Self.maxRetries - 1 {
+                        Thread.sleep(forTimeInterval: Self.retryDelay(attempt: attempt))
+                        continue
+                    }
+                } else {
+                    // Non-retryable (4xx other than 429) — drop events
+                    os_log("Flush failed: HTTP %d (non-retryable, events dropped)", log: Self.log, type: .error, status)
+                    let err = LayersError.networkError("HTTP \(status)")
+                    reportError(method: "flush", error: err)
+                    return .failure(err)
+                }
+            }
+        }
+
+        // All retries exhausted — requeue events
+        os_log("Flush: all retries exhausted, requeuing events", log: Self.log, type: .error)
+        requeueSilently(core: core, batchJson: batchJson)
+        let err = LayersError.networkError("All retries exhausted")
+        reportError(method: "flush", error: err)
+        return .failure(err)
+    }
+
+    /// Requeue a drained batch back into the Rust core queue. Errors are swallowed.
+    private func requeueSilently(core: LayersCoreHandle, batchJson: String) {
+        do {
+            _ = try core.requeueEvents(eventsJson: batchJson)
+        } catch {
+            os_log("Requeue failed: %{public}@", log: Self.log, type: .error, error.localizedDescription)
+        }
+    }
+
+    /// Calculate retry delay: base 1s, multiply by 2^attempt, add jitter 0-250ms, cap at 30s.
+    private static func retryDelay(attempt: Int) -> TimeInterval {
+        let base = 1.0 * pow(2.0, Double(attempt))
+        let delay = base
+        let jitter = delay * 0.25 * Double.random(in: 0...1.0)
+        return min(delay + jitter, 30.0)
     }
 
     /// Reset the SDK state, clearing user identity and properties.
@@ -717,6 +851,22 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
 
     // MARK: - Remote Config Polling
 
+    /// Parse a JSON array of `[key, value]` header pairs and apply them to a URLRequest.
+    /// Returns `true` if headers were parsed and applied, `false` on parse failure.
+    @discardableResult
+    private static func applyHeaders(from json: String, to request: inout URLRequest) -> Bool {
+        guard let data = json.data(using: .utf8),
+              let pairs = try? JSONSerialization.jsonObject(with: data) as? [[String]] else {
+            os_log("Failed to parse header JSON", log: log, type: .error)
+            return false
+        }
+        for pair in pairs {
+            guard pair.count == 2 else { continue }
+            request.setValue(pair[1], forHTTPHeaderField: pair[0])
+        }
+        return true
+    }
+
     /// Fetch remote config from the server synchronously, blocking up to `timeoutSecs`.
     /// Used during initialization so the SDK can read server-driven flags (e.g.
     /// `clipboard_attribution_enabled`) before firing the first `app_open` event.
@@ -724,12 +874,12 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
         guard let core = lockedCoreIfInitialized() else { return }
 
         let url: String
-        let etag: String?
+        let configHeaders: String
         do {
             url = try core.configUrl()
-            etag = try core.configEtag()
+            configHeaders = try core.configHeadersJson()
         } catch {
-            os_log("Failed to get config URL/ETag: %{public}@", log: Self.log, type: .error, error.localizedDescription)
+            os_log("Failed to get config URL/headers: %{public}@", log: Self.log, type: .error, error.localizedDescription)
             return
         }
 
@@ -740,11 +890,11 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
 
         var request = URLRequest(url: requestUrl)
         request.httpMethod = "GET"
-        request.setValue("application/json", forHTTPHeaderField: "Accept")
-        request.timeoutInterval = timeoutSecs
-        if let etag = etag {
-            request.setValue(etag, forHTTPHeaderField: "If-None-Match")
+        if !Self.applyHeaders(from: configHeaders, to: &request) {
+            os_log("Failed to parse config headers", log: Self.log, type: .error)
+            return
         }
+        request.timeoutInterval = timeoutSecs
 
         let group = DispatchGroup()
         group.enter()
@@ -801,12 +951,12 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
         guard let core = lockedCoreIfInitialized() else { return }
 
         let url: String
-        let etag: String?
+        let configHeaders: String
         do {
             url = try core.configUrl()
-            etag = try core.configEtag()
+            configHeaders = try core.configHeadersJson()
         } catch {
-            os_log("Failed to get config URL/ETag: %{public}@", log: Self.log, type: .error, error.localizedDescription)
+            os_log("Failed to get config URL/headers: %{public}@", log: Self.log, type: .error, error.localizedDescription)
             return
         }
 
@@ -817,11 +967,11 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
 
         var request = URLRequest(url: requestUrl)
         request.httpMethod = "GET"
-        request.setValue("application/json", forHTTPHeaderField: "Accept")
-        request.timeoutInterval = 10
-        if let etag = etag {
-            request.setValue(etag, forHTTPHeaderField: "If-None-Match")
+        if !Self.applyHeaders(from: configHeaders, to: &request) {
+            os_log("Failed to parse config headers", log: Self.log, type: .error)
+            return
         }
+        request.timeoutInterval = 10
 
         let task = URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
             guard self != nil else { return }
@@ -891,29 +1041,10 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
         )
         timer.setEventHandler { [weak self] in
             guard let self = self else { return }
-            // Prevent overlapping flushes
-            self.lock.lock()
-            guard !self._isFlushing else {
-                self.lock.unlock()
-                return
-            }
-            self._isFlushing = true
-            self.lock.unlock()
-
-            defer {
-                self.lock.lock()
-                self._isFlushing = false
-                self.lock.unlock()
-            }
-
             guard let core = self.lockedCoreIfInitialized() else { return }
-            do {
-                try core.flush()
-                if self.enableDebug {
-                    os_log("Periodic flush completed", log: Self.log, type: .debug)
-                }
-            } catch {
-                os_log("Periodic flush failed: %{public}@", log: Self.log, type: .error, error.localizedDescription)
+            guard core.queueDepth() > 0 else { return }
+            self._flushQueue.async {
+                _ = self.deliverBatch(core: core)
             }
         }
         lock.lock()
@@ -928,6 +1059,7 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
     /// offline to online, trigger a flush to deliver any queued events.
     private func startNetworkMonitor() {
         let monitor = NWPathMonitor()
+        // Reset to prevent spurious flush-on-reconnect after re-initialization
         _wasOffline = false
 
         monitor.pathUpdateHandler = { [weak self] path in
