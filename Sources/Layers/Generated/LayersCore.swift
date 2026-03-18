@@ -517,6 +517,11 @@ private struct FfiConverterString: FfiConverter {
  */
 public protocol LayersCoreHandleProtocol: AnyObject {
     /**
+     * Clear the Retry-After gate (e.g. after a successful flush).
+     */
+    func clearRetryAfter()
+
+    /**
      * Return the current ETag for conditional config requests.
      */
     func configEtag() throws -> String?
@@ -547,6 +552,15 @@ public protocol LayersCoreHandleProtocol: AnyObject {
     func eventsUrl() throws -> String
 
     /**
+     * Compute the retry delay using the Retry-After value as a floor.
+     *
+     * `backoff_ms` is the exponential backoff delay the wrapper would
+     * normally use. If a Retry-After delay was received, the returned
+     * delay is `max(retry_after_ms, backoff_ms)`.
+     */
+    func floorRetryDelay(backoffMs: UInt64, retryAfterSeconds: UInt64?) -> UInt64
+
+    /**
      * Flush queued events (synchronous).
      */
     func flush() throws
@@ -574,6 +588,13 @@ public protocol LayersCoreHandleProtocol: AnyObject {
     func getSessionId() throws -> String
 
     /**
+     * Associate subsequent events with a group (company, team, organization).
+     * Pass an empty string for `group_id` to clear the group association.
+     * `properties_json` is an optional JSON string of group properties.
+     */
+    func group(groupId: String, propertiesJson: String?) throws
+
+    /**
      * Identify the current user.
      */
     func identify(userId: String) throws
@@ -582,6 +603,11 @@ public protocol LayersCoreHandleProtocol: AnyObject {
      * Check whether the SDK is still initialized (not shut down).
      */
     func isInitialized() -> Bool
+
+    /**
+     * Check whether a server-requested Retry-After delay is currently active.
+     */
+    func isRetryAfterActive() -> Bool
 
     /**
      * Mark config as not modified (304 response) — resets the TTL timer
@@ -599,6 +625,11 @@ public protocol LayersCoreHandleProtocol: AnyObject {
      * delivery. Expects the same JSON array of events from drain_batch.
      */
     func requeueEvents(eventsJson: String) throws -> UInt32
+
+    /**
+     * Return the remaining Retry-After delay in milliseconds, or 0.
+     */
+    func retryAfterRemainingMs() -> UInt64
 
     /**
      * Track a screen view event.
@@ -645,6 +676,17 @@ public protocol LayersCoreHandleProtocol: AnyObject {
      * Platform wrappers call this after a successful HTTP GET to the config endpoint.
      */
     func updateRemoteConfig(configJson: String, etag: String?) throws
+
+    /**
+     * Update the Retry-After gate from an HTTP response.
+     *
+     * Platform wrappers call this after receiving an HTTP response from the
+     * ingest server. If the response is 429 or 503 with a `Retry-After`
+     * header, the gate is set so subsequent flush attempts are skipped.
+     *
+     * Returns the parsed delay in seconds, or `None` if not applicable.
+     */
+    func updateRetryAfter(status: UInt16, retryAfterHeader: String?) -> UInt64?
 }
 
 /**
@@ -715,6 +757,14 @@ open class LayersCoreHandle:
     }
 
     /**
+     * Clear the Retry-After gate (e.g. after a successful flush).
+     */
+    open func clearRetryAfter() { try! rustCall {
+        uniffi_layers_core_fn_method_layerscorehandle_clear_retry_after(self.uniffiClonePointer(), $0)
+    }
+    }
+
+    /**
      * Return the current ETag for conditional config requests.
      */
     open func configEtag() throws -> String? {
@@ -766,6 +816,21 @@ open class LayersCoreHandle:
     }
 
     /**
+     * Compute the retry delay using the Retry-After value as a floor.
+     *
+     * `backoff_ms` is the exponential backoff delay the wrapper would
+     * normally use. If a Retry-After delay was received, the returned
+     * delay is `max(retry_after_ms, backoff_ms)`.
+     */
+    open func floorRetryDelay(backoffMs: UInt64, retryAfterSeconds: UInt64?) -> UInt64 {
+        return try! FfiConverterUInt64.lift(try! rustCall {
+            uniffi_layers_core_fn_method_layerscorehandle_floor_retry_delay(self.uniffiClonePointer(),
+                                                                            FfiConverterUInt64.lower(backoffMs),
+                                                                            FfiConverterOptionUInt64.lower(retryAfterSeconds), $0)
+        })
+    }
+
+    /**
      * Flush queued events (synchronous).
      */
     open func flush() throws { try rustCallWithError(FfiConverterTypeUniFFIError.lift) {
@@ -812,6 +877,18 @@ open class LayersCoreHandle:
     }
 
     /**
+     * Associate subsequent events with a group (company, team, organization).
+     * Pass an empty string for `group_id` to clear the group association.
+     * `properties_json` is an optional JSON string of group properties.
+     */
+    open func group(groupId: String, propertiesJson: String?) throws { try rustCallWithError(FfiConverterTypeUniFFIError.lift) {
+        uniffi_layers_core_fn_method_layerscorehandle_group(self.uniffiClonePointer(),
+                                                            FfiConverterString.lower(groupId),
+                                                            FfiConverterOptionString.lower(propertiesJson), $0)
+    }
+    }
+
+    /**
      * Identify the current user.
      */
     open func identify(userId: String) throws { try rustCallWithError(FfiConverterTypeUniFFIError.lift) {
@@ -826,6 +903,15 @@ open class LayersCoreHandle:
     open func isInitialized() -> Bool {
         return try! FfiConverterBool.lift(try! rustCall {
             uniffi_layers_core_fn_method_layerscorehandle_is_initialized(self.uniffiClonePointer(), $0)
+        })
+    }
+
+    /**
+     * Check whether a server-requested Retry-After delay is currently active.
+     */
+    open func isRetryAfterActive() -> Bool {
+        return try! FfiConverterBool.lift(try! rustCall {
+            uniffi_layers_core_fn_method_layerscorehandle_is_retry_after_active(self.uniffiClonePointer(), $0)
         })
     }
 
@@ -855,6 +941,15 @@ open class LayersCoreHandle:
         return try FfiConverterUInt32.lift(rustCallWithError(FfiConverterTypeUniFFIError.lift) {
             uniffi_layers_core_fn_method_layerscorehandle_requeue_events(self.uniffiClonePointer(),
                                                                          FfiConverterString.lower(eventsJson), $0)
+        })
+    }
+
+    /**
+     * Return the remaining Retry-After delay in milliseconds, or 0.
+     */
+    open func retryAfterRemainingMs() -> UInt64 {
+        return try! FfiConverterUInt64.lift(try! rustCall {
+            uniffi_layers_core_fn_method_layerscorehandle_retry_after_remaining_ms(self.uniffiClonePointer(), $0)
         })
     }
 
@@ -940,6 +1035,23 @@ open class LayersCoreHandle:
                                                                            FfiConverterString.lower(configJson),
                                                                            FfiConverterOptionString.lower(etag), $0)
     }
+    }
+
+    /**
+     * Update the Retry-After gate from an HTTP response.
+     *
+     * Platform wrappers call this after receiving an HTTP response from the
+     * ingest server. If the response is 429 or 503 with a `Retry-After`
+     * header, the gate is set so subsequent flush attempts are skipped.
+     *
+     * Returns the parsed delay in seconds, or `None` if not applicable.
+     */
+    open func updateRetryAfter(status: UInt16, retryAfterHeader: String?) -> UInt64? {
+        return try! FfiConverterOptionUInt64.lift(try! rustCall {
+            uniffi_layers_core_fn_method_layerscorehandle_update_retry_after(self.uniffiClonePointer(),
+                                                                             FfiConverterUInt16.lower(status),
+                                                                             FfiConverterOptionString.lower(retryAfterHeader), $0)
+        })
     }
 }
 
@@ -1208,11 +1320,13 @@ public struct UniFfiDeviceContext {
     public let idfa: String?
     public let idfv: String?
     public let attStatus: String?
+    public let deeplinkId: String?
+    public let gclid: String?
     public let timezone: String?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(platform: UniFfiPlatform?, osVersion: String?, appVersion: String?, deviceModel: String?, locale: String?, buildNumber: String?, screenSize: String?, installId: String?, idfa: String?, idfv: String?, attStatus: String?, timezone: String?) {
+    public init(platform: UniFfiPlatform?, osVersion: String?, appVersion: String?, deviceModel: String?, locale: String?, buildNumber: String?, screenSize: String?, installId: String?, idfa: String?, idfv: String?, attStatus: String?, deeplinkId: String?, gclid: String?, timezone: String?) {
         self.platform = platform
         self.osVersion = osVersion
         self.appVersion = appVersion
@@ -1224,6 +1338,8 @@ public struct UniFfiDeviceContext {
         self.idfa = idfa
         self.idfv = idfv
         self.attStatus = attStatus
+        self.deeplinkId = deeplinkId
+        self.gclid = gclid
         self.timezone = timezone
     }
 }
@@ -1263,6 +1379,12 @@ extension UniFfiDeviceContext: Equatable, Hashable {
         if lhs.attStatus != rhs.attStatus {
             return false
         }
+        if lhs.deeplinkId != rhs.deeplinkId {
+            return false
+        }
+        if lhs.gclid != rhs.gclid {
+            return false
+        }
         if lhs.timezone != rhs.timezone {
             return false
         }
@@ -1281,6 +1403,8 @@ extension UniFfiDeviceContext: Equatable, Hashable {
         hasher.combine(idfa)
         hasher.combine(idfv)
         hasher.combine(attStatus)
+        hasher.combine(deeplinkId)
+        hasher.combine(gclid)
         hasher.combine(timezone)
     }
 }
@@ -1303,6 +1427,8 @@ public struct FfiConverterTypeUniFFIDeviceContext: FfiConverterRustBuffer {
                 idfa: FfiConverterOptionString.read(from: &buf),
                 idfv: FfiConverterOptionString.read(from: &buf),
                 attStatus: FfiConverterOptionString.read(from: &buf),
+                deeplinkId: FfiConverterOptionString.read(from: &buf),
+                gclid: FfiConverterOptionString.read(from: &buf),
                 timezone: FfiConverterOptionString.read(from: &buf)
             )
     }
@@ -1319,6 +1445,8 @@ public struct FfiConverterTypeUniFFIDeviceContext: FfiConverterRustBuffer {
         FfiConverterOptionString.write(value.idfa, into: &buf)
         FfiConverterOptionString.write(value.idfv, into: &buf)
         FfiConverterOptionString.write(value.attStatus, into: &buf)
+        FfiConverterOptionString.write(value.deeplinkId, into: &buf)
+        FfiConverterOptionString.write(value.gclid, into: &buf)
         FfiConverterOptionString.write(value.timezone, into: &buf)
     }
 }
@@ -1787,6 +1915,9 @@ private var initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
+    if uniffi_layers_core_checksum_method_layerscorehandle_clear_retry_after() != 8622 {
+        return InitializationResult.apiChecksumMismatch
+    }
     if uniffi_layers_core_checksum_method_layerscorehandle_config_etag() != 32954 {
         return InitializationResult.apiChecksumMismatch
     }
@@ -1800,6 +1931,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if uniffi_layers_core_checksum_method_layerscorehandle_events_url() != 60400 {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if uniffi_layers_core_checksum_method_layerscorehandle_floor_retry_delay() != 12493 {
         return InitializationResult.apiChecksumMismatch
     }
     if uniffi_layers_core_checksum_method_layerscorehandle_flush() != 23417 {
@@ -1817,10 +1951,16 @@ private var initializationResult: InitializationResult = {
     if uniffi_layers_core_checksum_method_layerscorehandle_get_session_id() != 55035 {
         return InitializationResult.apiChecksumMismatch
     }
+    if uniffi_layers_core_checksum_method_layerscorehandle_group() != 32224 {
+        return InitializationResult.apiChecksumMismatch
+    }
     if uniffi_layers_core_checksum_method_layerscorehandle_identify() != 37268 {
         return InitializationResult.apiChecksumMismatch
     }
     if uniffi_layers_core_checksum_method_layerscorehandle_is_initialized() != 18204 {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if uniffi_layers_core_checksum_method_layerscorehandle_is_retry_after_active() != 34554 {
         return InitializationResult.apiChecksumMismatch
     }
     if uniffi_layers_core_checksum_method_layerscorehandle_mark_config_not_modified() != 63447 {
@@ -1830,6 +1970,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if uniffi_layers_core_checksum_method_layerscorehandle_requeue_events() != 51517 {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if uniffi_layers_core_checksum_method_layerscorehandle_retry_after_remaining_ms() != 29171 {
         return InitializationResult.apiChecksumMismatch
     }
     if uniffi_layers_core_checksum_method_layerscorehandle_screen() != 7823 {
@@ -1854,6 +1997,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if uniffi_layers_core_checksum_method_layerscorehandle_update_remote_config() != 60771 {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if uniffi_layers_core_checksum_method_layerscorehandle_update_retry_after() != 51500 {
         return InitializationResult.apiChecksumMismatch
     }
     if uniffi_layers_core_checksum_constructor_layerscorehandle_init() != 21460 {

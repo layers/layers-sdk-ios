@@ -153,6 +153,8 @@ public final class ATTModule: @unchecked Sendable {
             idfa: getAdvertisingId(),
             idfv: getVendorId(),
             attStatus: currentStatus.rawValue,
+            deeplinkId: nil,
+            gclid: nil,
             timezone: nil
         )
         do {
