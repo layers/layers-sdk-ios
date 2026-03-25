@@ -225,9 +225,9 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
 
     /// NWPathMonitor for flush-on-reconnect.
     private var _networkMonitor: NWPathMonitor?
-    private let _monitorQueue = DispatchQueue(label: "io.layers.sdk.network-monitor")
+    private let _monitorQueue = DispatchQueue(label: "com.layers.sdk.network-monitor")
     /// Serial queue for HTTP event delivery (drain → send → retry/requeue).
-    private let _flushQueue = DispatchQueue(label: "io.layers.sdk.flush")
+    private let _flushQueue = DispatchQueue(label: "com.layers.sdk.flush")
     /// Tracks previous offline state for flush-on-reconnect. Only accessed on `_monitorQueue`.
     private var _wasOffline = false
     /// Cached network status updated by the existing NWPathMonitor. Thread-safe via `lock`.
@@ -1566,7 +1566,7 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
         }
     }
 
-    private static let log = OSLog(subsystem: "io.layers.sdk", category: "Layers")
+    private static let log = OSLog(subsystem: "com.layers.sdk", category: "Layers")
 
     private static let installIdKey = "com.layers.installId"
     private static let attributionDeeplinkIdKey = "com.layers.deeplinkId"
@@ -1790,7 +1790,7 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
                 log: Self.log,
                 type: .error
             )
-            let fallback = NSTemporaryDirectory() + "io.layers.sdk"
+            let fallback = NSTemporaryDirectory() + "com.layers.sdk"
             do {
                 try FileManager.default.createDirectory(atPath: fallback, withIntermediateDirectories: true)
             } catch {
@@ -1798,7 +1798,7 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
             }
             return fallback
         }
-        let dir = baseUrl.appendingPathComponent("io.layers.sdk", isDirectory: true)
+        let dir = baseUrl.appendingPathComponent("com.layers.sdk", isDirectory: true)
         do {
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         } catch {

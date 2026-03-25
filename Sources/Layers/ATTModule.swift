@@ -15,7 +15,7 @@ import UIKit
 @available(iOS 14.0, macOS 12.0, tvOS 14.0, watchOS 7.0, *)
 public final class ATTModule: @unchecked Sendable {
 
-    private static let log = OSLog(subsystem: "io.layers.sdk", category: "ATTModule")
+    private static let log = OSLog(subsystem: "com.layers.sdk", category: "ATTModule")
 
     // MARK: - Types
 

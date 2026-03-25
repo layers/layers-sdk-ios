@@ -6,7 +6,7 @@ import os.log
 @available(iOS 14.0, macOS 12.0, tvOS 14.0, watchOS 7.0, *)
 public final class DeepLinksModule: @unchecked Sendable {
 
-    private static let log = OSLog(subsystem: "io.layers.sdk", category: "DeepLinksModule")
+    private static let log = OSLog(subsystem: "com.layers.sdk", category: "DeepLinksModule")
 
     // MARK: - Types
 
