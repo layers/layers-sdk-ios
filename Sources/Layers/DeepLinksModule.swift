@@ -143,6 +143,23 @@ public final class DeepLinksModule: @unchecked Sendable {
             } catch {
                 os_log("deep_link_opened track failed: %{public}@", log: Self.log, type: .error, error.localizedDescription)
             }
+
+            // Auto-persist click IDs as attribution data so they flow into
+            // all subsequent events (matching the RN SDK pattern).
+            // Preserve the existing deeplinkId to avoid clearing a previously-set value.
+            let fbclid = attribution.clickIds["fbclid"]?.nilIfEmpty
+            let gclid = attribution.clickIds["gclid"]?.nilIfEmpty
+            let ttclid = attribution.clickIds["ttclid"]?.nilIfEmpty
+            let msclkid = attribution.clickIds["msclkid"]?.nilIfEmpty
+            if fbclid != nil || gclid != nil || ttclid != nil || msclkid != nil {
+                Layers.shared.setAttributionData(
+                    deeplinkId: Layers.shared.attributionDeeplinkId,
+                    gclid: gclid ?? Layers.shared.attributionGclid,
+                    fbclid: fbclid ?? Layers.shared.attributionFbclid,
+                    ttclid: ttclid ?? Layers.shared.attributionTtclid,
+                    msclkid: msclkid ?? Layers.shared.attributionMsclkid
+                )
+            }
         }
 
         // Notify listeners
@@ -180,4 +197,8 @@ public final class DeepLinksModule: @unchecked Sendable {
         listeners.removeAll()
         lock.unlock()
     }
+}
+
+private extension String {
+    var nilIfEmpty: String? { isEmpty ? nil : self }
 }

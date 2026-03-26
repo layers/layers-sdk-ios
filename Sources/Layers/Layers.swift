@@ -213,9 +213,26 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
     /// Internal visibility so tests can set this via `@testable import`.
     var _hadPriorSdkState = false
 
+    /// Stored base URL from config, for user properties HTTP POST.
+    private var _configBaseUrl: String?
+
     /// Attribution data stored for attachment to subsequent events.
     private var _attributionDeeplinkId: String?
+    /// The current deep link ID for internal use (e.g. DeepLinksModule preserving the value).
+    internal var attributionDeeplinkId: String? { _attributionDeeplinkId }
     private var _attributionGclid: String?
+    /// The current GCLID for internal use (e.g. DeepLinksModule preserving the value).
+    internal var attributionGclid: String? { _attributionGclid }
+    private var _attributionFbclid: String?
+    /// The current FBCLID for internal use (e.g. DeepLinksModule preserving the value).
+    internal var attributionFbclid: String? { _attributionFbclid }
+    private var _attributionFbc: String?
+    private var _attributionTtclid: String?
+    /// The current TTCLID for internal use (e.g. DeepLinksModule preserving the value).
+    internal var attributionTtclid: String? { _attributionTtclid }
+    private var _attributionMsclkid: String?
+    /// The current MSCLKID for internal use (e.g. DeepLinksModule preserving the value).
+    internal var attributionMsclkid: String? { _attributionMsclkid }
     /// Last device context sent to the Rust core, cached so incremental updates
     /// (e.g. deeplink_id, IDFA) can preserve existing values.
     private var _lastDeviceContext: UniFfiDeviceContext?
@@ -379,6 +396,7 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
         _enableDebug = config.enableDebug
         _configAppId = config.appId
         _configEnvironment = config.environment
+        _configBaseUrl = config.baseUrl
         lock.unlock()
 
         #if os(iOS) || os(tvOS)
@@ -634,6 +652,7 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
         }
         do {
             try core.setUserProperties(propertiesJson: Self.jsonString(from: properties) ?? "{}")
+            sendUserPropertiesAsync(properties, setOnce: false)
             return .success(())
         } catch {
             let mapped = Self.mapError(error)
@@ -661,6 +680,7 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
         }
         do {
             try core.setUserPropertiesOnce(propertiesJson: Self.jsonString(from: properties) ?? "{}")
+            sendUserPropertiesAsync(properties, setOnce: true)
             return .success(())
         } catch {
             let mapped = Self.mapError(error)
@@ -731,16 +751,33 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
     /// The values are persisted in UserDefaults so they survive app restarts.
     /// Pass `nil` for a parameter to clear that value.
     ///
-    /// When set, `deeplink_id` and/or `gclid` are included in every event's properties.
+    /// When set, click IDs (`gclid`, `fbclid`, `ttclid`, `msclkid`) are included
+    /// in every event's properties. For fbclid, a formatted `$fbc` parameter
+    /// (`fb.1.{timestamp}.{fbclid}`) is also included.
     ///
     /// - Parameters:
     ///   - deeplinkId: Deep link identifier for server-side attribution matching.
     ///   - gclid: Google Click Identifier from ad click URLs.
+    ///   - fbclid: Facebook Click Identifier from ad click URLs.
+    ///   - ttclid: TikTok Click Identifier from ad click URLs.
+    ///   - msclkid: Microsoft Click Identifier from ad click URLs.
     @discardableResult
-    public func setAttributionData(deeplinkId: String? = nil, gclid: String? = nil) -> SafeResult<Void> {
+    public func setAttributionData(
+        deeplinkId: String? = nil,
+        gclid: String? = nil,
+        fbclid: String? = nil,
+        ttclid: String? = nil,
+        msclkid: String? = nil
+    ) -> SafeResult<Void> {
+        let fbc: String? = fbclid != nil ? Self.formatFbc(fbclid!) : nil
+
         lock.lock()
         _attributionDeeplinkId = deeplinkId
         _attributionGclid = gclid
+        _attributionFbclid = fbclid
+        _attributionFbc = fbc
+        _attributionTtclid = ttclid
+        _attributionMsclkid = msclkid
         lock.unlock()
 
         // Update the Rust core's DeviceContext with the new deeplink_id so the
@@ -770,30 +807,58 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
             }
         }
 
-        if let deeplinkId = deeplinkId {
-            UserDefaults.standard.set(deeplinkId, forKey: Self.attributionDeeplinkIdKey)
-        } else {
-            UserDefaults.standard.removeObject(forKey: Self.attributionDeeplinkIdKey)
-        }
-        if let gclid = gclid {
-            UserDefaults.standard.set(gclid, forKey: Self.attributionGclidKey)
-        } else {
-            UserDefaults.standard.removeObject(forKey: Self.attributionGclidKey)
-        }
+        // Persist to UserDefaults
+        Self.persistOptionalString(deeplinkId, forKey: Self.attributionDeeplinkIdKey)
+        Self.persistOptionalString(gclid, forKey: Self.attributionGclidKey)
+        Self.persistOptionalString(fbclid, forKey: Self.attributionFbclidKey)
+        Self.persistOptionalString(fbc, forKey: Self.attributionFbcKey)
+        Self.persistOptionalString(ttclid, forKey: Self.attributionTtclidKey)
+        Self.persistOptionalString(msclkid, forKey: Self.attributionMsclkidKey)
 
         if enableDebug {
-            os_log("setAttributionData(deeplinkId: %{public}@, gclid: %{public}@)", log: Self.log, type: .debug, String(describing: deeplinkId), String(describing: gclid))
+            os_log("setAttributionData(deeplinkId: %{public}@, gclid: %{public}@, fbclid: %{public}@, ttclid: %{public}@, msclkid: %{public}@)", log: Self.log, type: .debug, String(describing: deeplinkId), String(describing: gclid), String(describing: fbclid), String(describing: ttclid), String(describing: msclkid))
         }
         return .success(())
     }
 
-    /// Merge attribution properties into the given event properties dictionary.
-    ///
-    /// `deeplink_id` and `gclid` now flow through DeviceContext on the Rust core
-    /// (set via `setAttributionData`), so no client-side merging is needed.
-    /// This method is kept for backward compatibility but returns properties unchanged.
+    /// Persist an optional string to UserDefaults, removing the key if nil.
+    private static func persistOptionalString(_ value: String?, forKey key: String) {
+        if let value = value {
+            UserDefaults.standard.set(value, forKey: key)
+        } else {
+            UserDefaults.standard.removeObject(forKey: key)
+        }
+    }
+
+    /// Format a raw fbclid into the Meta Conversions API `$fbc` parameter format.
+    /// Format: `fb.1.{timestamp_ms}.{fbclid}`
+    static func formatFbc(_ fbclid: String) -> String {
+        let timestampMs = Int(Date().timeIntervalSince1970 * 1000)
+        return "fb.1.\(timestampMs).\(fbclid)"
+    }
+
+    /// Merge attribution properties (click IDs) into the given event properties.
+    /// `deeplink_id` flows through DeviceContext on the Rust core; other fields
+    /// flow through properties.
     private func mergeAttributionProperties(_ properties: [String: Any]) -> [String: Any] {
-        return properties
+        lock.lock()
+        let gclid = _attributionGclid
+        let fbclid = _attributionFbclid
+        let fbc = _attributionFbc
+        let ttclid = _attributionTtclid
+        let msclkid = _attributionMsclkid
+        lock.unlock()
+
+        let hasAttribution = gclid != nil || fbclid != nil || fbc != nil || ttclid != nil || msclkid != nil
+        guard hasAttribution else { return properties }
+
+        var merged = properties
+        if let gclid = gclid, merged["gclid"] == nil { merged["gclid"] = gclid }
+        if let fbclid = fbclid, merged["fbclid"] == nil { merged["fbclid"] = fbclid }
+        if let fbc = fbc, merged["$fbc"] == nil { merged["$fbc"] = fbc }
+        if let ttclid = ttclid, merged["ttclid"] == nil { merged["ttclid"] = ttclid }
+        if let msclkid = msclkid, merged["msclkid"] == nil { merged["msclkid"] = msclkid }
+        return merged
     }
 
     /// Restore persisted attribution data from UserDefaults.
@@ -801,9 +866,18 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
     private func restoreAttributionData() {
         let deeplinkId = UserDefaults.standard.string(forKey: Self.attributionDeeplinkIdKey)
         let gclid = UserDefaults.standard.string(forKey: Self.attributionGclidKey)
+        let fbclid = UserDefaults.standard.string(forKey: Self.attributionFbclidKey)
+        let fbc = UserDefaults.standard.string(forKey: Self.attributionFbcKey)
+        let ttclid = UserDefaults.standard.string(forKey: Self.attributionTtclidKey)
+        let msclkid = UserDefaults.standard.string(forKey: Self.attributionMsclkidKey)
+
         lock.lock()
         _attributionDeeplinkId = deeplinkId
         _attributionGclid = gclid
+        _attributionFbclid = fbclid
+        _attributionFbc = fbc
+        _attributionTtclid = ttclid
+        _attributionMsclkid = msclkid
         lock.unlock()
 
         // Sync restored attribution data to the Rust core's DeviceContext so the
@@ -833,8 +907,8 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
             }
         }
 
-        if enableDebug && (deeplinkId != nil || gclid != nil) {
-            os_log("Restored attribution data: deeplinkId=%{public}@, gclid=%{public}@", log: Self.log, type: .debug, String(describing: deeplinkId), String(describing: gclid))
+        if enableDebug && (deeplinkId != nil || gclid != nil || fbclid != nil || ttclid != nil || msclkid != nil) {
+            os_log("Restored attribution data: deeplinkId=%{public}@, gclid=%{public}@, fbclid=%{public}@, ttclid=%{public}@, msclkid=%{public}@", log: Self.log, type: .debug, String(describing: deeplinkId), String(describing: gclid), String(describing: fbclid), String(describing: ttclid), String(describing: msclkid))
         }
     }
 
@@ -1202,9 +1276,14 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
             _hadPriorSdkState = false
             _attributionDeeplinkId = nil
             _attributionGclid = nil
+            _attributionFbclid = nil
+            _attributionFbc = nil
+            _attributionTtclid = nil
+            _attributionMsclkid = nil
             _initListener = nil
             _configAppId = nil
             _configEnvironment = .production
+            _configBaseUrl = nil
             _recentEvents = []
             _lastFlushResult = nil
             lock.unlock()
@@ -1571,6 +1650,10 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
     private static let installIdKey = "com.layers.installId"
     private static let attributionDeeplinkIdKey = "com.layers.deeplinkId"
     private static let attributionGclidKey = "com.layers.gclid"
+    private static let attributionFbclidKey = "com.layers.fbclid"
+    private static let attributionFbcKey = "com.layers.fbc"
+    private static let attributionTtclidKey = "com.layers.ttclid"
+    private static let attributionMsclkidKey = "com.layers.msclkid"
 
     /// Returns a persistent install ID, generating one on first launch.
     /// Also records whether prior SDK state existed (used by install event gating).
@@ -1780,6 +1863,72 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
             return nil
         }
         return str
+    }
+
+    // MARK: - User Properties HTTP POST
+
+    /// Default ingest API base URL.
+    private static let defaultBaseUrl = "https://in.layers.com"
+
+    /// Fire-and-forget POST to /users/properties.
+    /// Best-effort: errors are silently swallowed.
+    private func sendUserPropertiesAsync(_ properties: [String: Any], setOnce: Bool) {
+        lock.lock()
+        let appId = _configAppId
+        let userId = _appUserId
+        let anonId = _anonymousId
+        let baseUrlConfig = _configBaseUrl
+        lock.unlock()
+
+        guard let appId = appId else { return }
+
+        let appUserId = userId ?? anonId ?? ""
+        let baseUrl = (baseUrlConfig ?? Self.defaultBaseUrl)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+
+        var payload: [String: Any] = [
+            "app_id": appId,
+            "app_user_id": appUserId,
+            "properties": properties,
+            "timestamp": Self.iso8601Timestamp()
+        ]
+        if setOnce {
+            payload["set_once"] = true
+        }
+
+        guard let bodyData = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]) else {
+            return
+        }
+
+        guard let url = URL(string: "\(baseUrl)/users/properties") else { return }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.httpBody = bodyData
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(appId, forHTTPHeaderField: "X-App-Id")
+        request.setValue("swift/\(Self.sdkVersionString())", forHTTPHeaderField: "X-SDK-Version")
+        request.timeoutInterval = 10
+
+        // Fire-and-forget on a background queue
+        URLSession.shared.dataTask(with: request) { _, _, _ in
+            // Best-effort — don't throw on network errors
+        }.resume()
+    }
+
+    /// Return the current timestamp in ISO 8601 format.
+    private static func iso8601Timestamp() -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter.string(from: Date())
+    }
+
+    /// Return the SDK version string from the bundle, or a fallback.
+    private static func sdkVersionString() -> String {
+        if let version = Bundle(for: Layers.self).infoDictionary?["CFBundleShortVersionString"] as? String {
+            return version
+        }
+        return "unknown"
     }
 
     private static func persistenceDirectory() -> String {
@@ -2095,10 +2244,22 @@ public extension Layers {
         shared.setConsent(consent)
     }
 
-    /// Store attribution data for server-side matching. Delegates to ``Layers/setAttributionData(deeplinkId:gclid:)``.
+    /// Store attribution data for server-side matching. Delegates to ``Layers/setAttributionData(deeplinkId:gclid:fbclid:ttclid:msclkid:)``.
     @discardableResult
-    static func setAttributionData(deeplinkId: String? = nil, gclid: String? = nil) -> SafeResult<Void> {
-        shared.setAttributionData(deeplinkId: deeplinkId, gclid: gclid)
+    static func setAttributionData(
+        deeplinkId: String? = nil,
+        gclid: String? = nil,
+        fbclid: String? = nil,
+        ttclid: String? = nil,
+        msclkid: String? = nil
+    ) -> SafeResult<Void> {
+        shared.setAttributionData(
+            deeplinkId: deeplinkId,
+            gclid: gclid,
+            fbclid: fbclid,
+            ttclid: ttclid,
+            msclkid: msclkid
+        )
     }
 
     /// Flush queued events to the server asynchronously. Delegates to ``Layers/flush()``.
