@@ -31,6 +31,7 @@ public protocol LayersEvent {
 /// Layers.track(StandardEvent.viewItem(itemId: "sku_123", name: "Blue Widget"))
 /// ```
 public enum StandardEvent: String, LayersEvent, Sendable {
+    case appInstall = "app_install"
     case appOpen = "app_open"
     case login = "login"
     case signUp = "sign_up"

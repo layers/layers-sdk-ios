@@ -1829,6 +1829,19 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
         }
 
         let json = Self.jsonString(from: props)
+        // Send app_install before app_open on first launch for CAPI forwarding
+        if isFirstLaunch {
+            do {
+                try core.track(
+                    eventName: "app_install",
+                    propertiesJson: json,
+                    userId: nil,
+                    anonymousId: nil
+                )
+            } catch {
+                os_log("app_install track failed: %{public}@", log: Self.log, type: .error, error.localizedDescription)
+            }
+        }
         do {
             try core.track(
                 eventName: "app_open",
