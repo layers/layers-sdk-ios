@@ -75,6 +75,12 @@ public struct LayersConfig: Sendable {
     public let appId: String
     public let environment: LayersEnvironment
     public let enableDebug: Bool
+    /// Enable per-device DebugView. When `true`, the SDK mints a stable UUID
+    /// the first time the SDK is initialized, persists it alongside the
+    /// identity record, and sends `X-Debug-Token: <uuid>` in every request to
+    /// the ingest server. Use ``Layers/getDebugToken()`` to retrieve the
+    /// token for displaying in dev UIs. Defaults to `false`.
+    public let debug: Bool
     public let flushQueueSize: UInt32
     public let flushIntervalSecs: UInt32
     public let maxQueueSize: UInt32
@@ -83,41 +89,132 @@ public struct LayersConfig: Sendable {
     /// Whether to automatically fire an `app_open` event during initialization.
     /// Set to `false` if you want to fire the event manually. Defaults to `true`.
     public let autoTrackAppOpen: Bool
+    /// Whether to automatically capture lifecycle events (`$first_open`, `$app_install`,
+    /// `$app_update`, `$app_open`, `$app_background`, `$app_terminate`). Defaults to `true`.
+    /// Independent of `autoTrackAppOpen`, which controls the legacy `app_open`
+    /// (no `$` prefix) attribution event.
+    public let automaticLifecycleTrackingEnabled: Bool
+    /// Whether to automatically capture `$screen_view` events by method-swizzling
+    /// `UIViewController.viewDidAppear(_:)`. Defaults to `true`. Note that swizzling
+    /// only catches UIKit screens — SwiftUI views must use `View.layersScreen(...)`.
+    public let automaticScreenTrackingEnabled: Bool
+    /// Whether to automatically capture StoreKit 2 in-app purchases via `Transaction.updates`.
+    /// Defaults to `false` for privacy posture — opt in explicitly.
+    public let automaticPurchaseTrackingEnabled: Bool
+    /// Optional Tier 4 bootstrap data — pre-evaluated feature flags + payloads
+    /// to seed the cache before the first `/config` fetch returns. Critical
+    /// for SSR-rendered apps that can't wait on a network round-trip.
+    public let featureFlagBootstrap: BootstrapData?
+
+    // MARK: Tier 9 — Privacy posture
+
+    /// Opt-in-by-default mode. When `true`, the SDK queues events but does
+    /// NOT flush until the host app makes its first explicit `setConsent`
+    /// call granting `analyticsStorage`. This is stricter than the default
+    /// Consent Mode v2 posture (which already defaults to Denied) — it
+    /// explicitly waits for affirmative user action.
+    public let consentRequired: Bool
 
     public init(
         appId: String,
         environment: LayersEnvironment = .production,
         enableDebug: Bool = false,
+        debug: Bool = false,
         flushQueueSize: UInt32 = 20,
         flushIntervalSecs: UInt32 = 30,
         maxQueueSize: UInt32 = 10000,
         baseUrl: String? = nil,
-        autoTrackAppOpen: Bool = true
+        autoTrackAppOpen: Bool = true,
+        automaticLifecycleTrackingEnabled: Bool = true,
+        automaticScreenTrackingEnabled: Bool = true,
+        automaticPurchaseTrackingEnabled: Bool = false,
+        consentRequired: Bool = false,
+        featureFlagBootstrap: BootstrapData? = nil
     ) {
         self.appId = appId
         self.environment = environment
         self.enableDebug = enableDebug
+        self.debug = debug
         self.flushQueueSize = flushQueueSize
         self.flushIntervalSecs = flushIntervalSecs
         self.maxQueueSize = maxQueueSize
         self.baseUrl = baseUrl
         self.autoTrackAppOpen = autoTrackAppOpen
+        self.automaticLifecycleTrackingEnabled = automaticLifecycleTrackingEnabled
+        self.automaticScreenTrackingEnabled = automaticScreenTrackingEnabled
+        self.automaticPurchaseTrackingEnabled = automaticPurchaseTrackingEnabled
+        self.consentRequired = consentRequired
+        self.featureFlagBootstrap = featureFlagBootstrap
     }
 }
 
-// MARK: - ConsentSettings
+// MARK: - ConsentSettings (Firebase Consent Mode v2)
 
+/// Consent across the four Firebase Consent Mode v2 categories.
+///
+/// All four fields default to `nil` (treated as Denied for gating). The
+/// `analytics` / `advertising` fields are deprecated aliases retained for
+/// pre–Tier-9 callers; new code should set the explicit v2 fields.
+///
+/// Defaults are aligned with Consent Mode v2's opt-in posture: nothing
+/// flushes to the network until the host app sets `analyticsStorage = true`.
 public struct ConsentSettings: Sendable, Equatable {
-    public var analytics: Bool?
-    public var advertising: Bool?
+    /// Gates analytics events. CMv2 default: Denied.
+    public var analyticsStorage: Bool?
+    /// Gates ad-related identifiers (IDFA, click IDs). CMv2 default: Denied.
+    public var adStorage: Bool?
+    /// Gates user data being forwarded to ad partners. CMv2 default: Denied.
+    public var adUserData: Bool?
+    /// Gates personalized advertising. CMv2 default: Denied.
+    public var adPersonalization: Bool?
 
-    public init(analytics: Bool? = nil, advertising: Bool? = nil) {
-        self.analytics = analytics
-        self.advertising = advertising
+    /// DEPRECATED — alias for `analyticsStorage`.
+    @available(*, deprecated, renamed: "analyticsStorage")
+    public var analytics: Bool? {
+        get { analyticsStorage }
+        set { analyticsStorage = newValue }
+    }
+    /// DEPRECATED — alias for `adStorage`.
+    @available(*, deprecated, renamed: "adStorage")
+    public var advertising: Bool? {
+        get { adStorage }
+        set { adStorage = newValue }
     }
 
-    public static let denied = ConsentSettings(analytics: false, advertising: false)
-    public static let full = ConsentSettings(analytics: true, advertising: true)
+    public init(
+        analyticsStorage: Bool? = nil,
+        adStorage: Bool? = nil,
+        adUserData: Bool? = nil,
+        adPersonalization: Bool? = nil
+    ) {
+        self.analyticsStorage = analyticsStorage
+        self.adStorage = adStorage
+        self.adUserData = adUserData
+        self.adPersonalization = adPersonalization
+    }
+
+    /// DEPRECATED legacy initializer. Maps `analytics` → `analyticsStorage`
+    /// and `advertising` → all three ad-related categories.
+    @available(*, deprecated, message: "Use init(analyticsStorage:adStorage:adUserData:adPersonalization:)")
+    public init(analytics: Bool?, advertising: Bool?) {
+        self.analyticsStorage = analytics
+        self.adStorage = advertising
+        self.adUserData = advertising
+        self.adPersonalization = advertising
+    }
+
+    public static let denied = ConsentSettings(
+        analyticsStorage: false,
+        adStorage: false,
+        adUserData: false,
+        adPersonalization: false
+    )
+    public static let full = ConsentSettings(
+        analyticsStorage: true,
+        adStorage: true,
+        adUserData: true,
+        adPersonalization: true
+    )
 }
 
 // MARK: - Layers SDK
@@ -266,6 +363,14 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
     /// Config poll interval in seconds.
     private static let configPollIntervalSecs: UInt32 = 300
 
+    // MARK: - Tier 4 Feature-Flag Listener Bookkeeping
+
+    /// Auto-incrementing identifier used to address listeners on cancel.
+    private var _featureFlagListenerNextId: UInt64 = 0
+    /// Registered listeners keyed by id. The dispose closure looks up by id
+    /// rather than by closure equality (closures aren't Equatable).
+    private var _featureFlagListeners: [UInt64: ([String: FeatureFlagValue]) -> Void] = [:]
+
     /// SKAdNetwork integration (iOS only).
     public let skan = SKANModule()
     /// App Tracking Transparency (iOS only).
@@ -282,6 +387,20 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
     public let superwall = SuperwallModule()
     /// Optional RevenueCat integration.
     public let revenueCat = RevenueCatModule()
+    /// Auto-capture lifecycle events (`$first_open`, `$app_install`, `$app_update`,
+    /// `$app_open`, `$app_background`, `$app_terminate`). Wiring is gated by
+    /// `LayersConfig.automaticLifecycleTrackingEnabled`.
+    public let lifecycle = LifecycleModule()
+    /// Auto-capture `$screen_view` from UIKit `viewDidAppear`. Wiring is gated by
+    /// `LayersConfig.automaticScreenTrackingEnabled`.
+    public let screenTracking = ScreenTrackingModule()
+    /// Tier 8 — In-product surveys & messaging (iOS only).
+    #if canImport(UIKit)
+    @available(iOS 13.0, tvOS 13.0, macCatalyst 13.0, *)
+    public lazy var surveys: SurveysModule = SurveysModule(coreProvider: { [weak self] in
+        return self?.core
+    })
+    #endif
 
     public var isInitialized: Bool {
         lock.lock()
@@ -294,6 +413,11 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
         defer { lock.unlock() }
         return _core
     }
+
+    /// Internal-only: exposes the underlying core handle for tests that need
+    /// to inspect queue depth, flag-evaluation side effects, etc. without
+    /// going through the wrapper's narrowed API. Tests use `@testable import`.
+    var exposedCoreForTesting: LayersCoreHandle? { core }
 
     private init() {}
 
@@ -334,8 +458,15 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
             maxQueueSize: config.maxQueueSize,
             maxBatchSize: nil,
             enableDebug: config.enableDebug,
+            debug: config.debug,
             sdkVersion: nil,
-            persistenceDir: persistencePath
+            persistenceDir: persistencePath,
+            // Tier 9 (privacy posture): respectDnt + cookielessMode are
+            // web-only; native Swift always passes nil. consentRequired
+            // is plumbed from LayersConfig.
+            respectDnt: nil,
+            cookielessMode: nil,
+            consentRequired: config.consentRequired
         )
 
         let handle: LayersCoreHandle
@@ -360,6 +491,13 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
             )
             try handle.setDeviceContext(context: deviceContext)
             _lastDeviceContext = deviceContext
+
+            // Tier 4: seed feature-flag bootstrap data BEFORE wiring submodules
+            // so anything that fires synchronously during attach() (e.g. an
+            // analytics callback evaluating a flag) sees the bootstrap state.
+            if let bootstrap = config.featureFlagBootstrap {
+                try handle.setFeatureFlagBootstrap(bootstrapJson: bootstrap.toJSONString())
+            }
         } catch {
             lock.lock()
             _isInitializing = false
@@ -373,7 +511,7 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
         att.attach(core: handle)
         deepLinks.attach(core: handle)
         commerce.attach(core: handle, skan: skan)
-        superwall.attach(layers: self)
+        superwall.attach(sdk: self)
         revenueCat.attach(core: handle)
 
         // If ATT is already authorized, sync IDFA/IDFV to core immediately
@@ -411,16 +549,24 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
         lock.lock()
         _backgroundObserver = observer
         lock.unlock()
-        // Background flush via BGAppRefreshTask is available in
-        // BackgroundFlushTask.swift. Consumers opt in by calling
-        // BackgroundFlushTask.registerBackgroundFlush() at app launch.
-        // Auto-schedule here so consumers who registered get periodic flushes.
-        BackgroundFlushTask.scheduleBackgroundFlush()
+        // Auto-register the BGTask handler. Idempotent — safe if the app
+        // already called registerBackgroundFlush() from App.init().
+        // If the plist entry is missing, this returns false and we skip scheduling.
+        if BackgroundFlushTask._registerIfNeeded() {
+            BackgroundFlushTask.scheduleBackgroundFlush()
+        }
 
         #endif
 
         // Fetch remote config synchronously (up to 2s) so we can check clipboard_attribution_enabled
         fetchRemoteConfigSync(timeoutSecs: 2.0)
+
+        // Tier 4: any listeners registered before initialize() are now safe to
+        // fire — bootstrap (if any) has been seeded and the remote config
+        // fetch has populated server-side flag definitions.
+        if config.featureFlagBootstrap != nil {
+            fireFeatureFlagListeners()
+        }
 
         // Read remote config and apply server-driven settings
         let clipboardEnabled: Bool
@@ -444,6 +590,24 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
 
         // Collect attribution signals and fire app_open with them (if enabled)
         trackAttributionSignals(core: handle, clipboardAttributionEnabled: clipboardEnabled, autoTrackAppOpen: config.autoTrackAppOpen)
+
+        // Tier 2: lifecycle / screen / purchase auto-capture.
+        // Wire these AFTER attribution so the legacy `app_open` event fires first
+        // (it carries attribution context); the lifecycle module then layers on
+        // the canonical `$app_open` and friends.
+        if config.automaticLifecycleTrackingEnabled {
+            lifecycle.attach(sdk: self)
+        }
+        if config.automaticScreenTrackingEnabled {
+            screenTracking.attach(sdk: self)
+        }
+        #if canImport(StoreKit)
+        if config.automaticPurchaseTrackingEnabled {
+            if #available(iOS 15.0, macOS 13.0, tvOS 15.0, watchOS 8.0, *) {
+                commerce.startAutomaticPurchaseTracking()
+            }
+        }
+        #endif
 
         // Start periodic remote config polling
         startConfigPolling()
@@ -540,6 +704,255 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
             reportError(method: "screen", error: mapped)
             return .failure(mapped)
         }
+    }
+
+    // MARK: - Performance Tracing
+
+    /// Time a synchronous block and emit a `$performance_trace` event with the
+    /// elapsed wall-clock time, success flag, and any extra properties.
+    @discardableResult
+    public func trace<T>(name: String, properties: [String: Any] = [:], _ block: () throws -> T) rethrows -> T {
+        let start = CFAbsoluteTimeGetCurrent()
+        do {
+            let result = try block()
+            emitTrace(name: name, durationMs: (CFAbsoluteTimeGetCurrent() - start) * 1000.0, succeeded: true, properties: properties)
+            return result
+        } catch {
+            emitTrace(name: name, durationMs: (CFAbsoluteTimeGetCurrent() - start) * 1000.0, succeeded: false, properties: properties)
+            throw error
+        }
+    }
+
+    /// Async variant of ``trace(name:properties:_:)``.
+    @discardableResult
+    public func trace<T>(name: String, properties: [String: Any] = [:], _ block: () async throws -> T) async rethrows -> T {
+        let start = CFAbsoluteTimeGetCurrent()
+        do {
+            let result = try await block()
+            emitTrace(name: name, durationMs: (CFAbsoluteTimeGetCurrent() - start) * 1000.0, succeeded: true, properties: properties)
+            return result
+        } catch {
+            emitTrace(name: name, durationMs: (CFAbsoluteTimeGetCurrent() - start) * 1000.0, succeeded: false, properties: properties)
+            throw error
+        }
+    }
+
+    private func emitTrace(name: String, durationMs: Double, succeeded: Bool, properties: [String: Any]) {
+        var props = properties
+        props["trace_name"] = name
+        props["duration_ms"] = durationMs
+        props["succeeded"] = succeeded
+        _ = track("$performance_trace", properties: props)
+    }
+
+    // MARK: - Tier 4: Feature Flags
+
+    /// Evaluate a feature flag.
+    ///
+    /// - Parameter key: The flag key.
+    /// - Returns: `.boolean(true)` / `.boolean(false)` for binary flags, or
+    ///   `.string("variant_key")` for multivariate flags. Returns `nil` for
+    ///   unknown flags or before the SDK is initialized.
+    ///
+    /// As a side effect, the Rust core emits one `$feature_flag_called`
+    /// exposure event per `(flag_key, response)` pair per session. Subsequent
+    /// calls with the same response are deduplicated server-side.
+    public func getFeatureFlag(_ key: String) -> FeatureFlagValue? {
+        guard let core = lockedCoreIfInitialized() else { return nil }
+        do {
+            let json = try core.getFeatureFlagJson(flagKey: key)
+            return FeatureFlagValue.parse(json: json)
+        } catch {
+            reportError(method: "getFeatureFlag", error: Self.mapError(error))
+            return nil
+        }
+    }
+
+    /// Look up the JSON payload attached to a flag and decode it as `T`.
+    ///
+    /// Does NOT emit `$feature_flag_called` — pair with `getFeatureFlag(_:)`
+    /// or `isFeatureEnabled(_:)` to record an exposure first.
+    ///
+    /// - Parameter key: The flag key.
+    /// - Returns: A decoded value of type `T`, or `nil` if the flag has no
+    ///   payload, the SDK is not initialized, or decoding fails.
+    public func getFeatureFlagPayload<T: Decodable>(_ key: String, as type: T.Type = T.self) -> T? {
+        guard let core = lockedCoreIfInitialized() else { return nil }
+        do {
+            let json = try core.getFeatureFlagPayloadJson(flagKey: key)
+            if json.isEmpty || json == "null" { return nil }
+            guard let data = json.data(using: .utf8) else { return nil }
+            return try? JSONDecoder().decode(T.self, from: data)
+        } catch {
+            reportError(method: "getFeatureFlagPayload", error: Self.mapError(error))
+            return nil
+        }
+    }
+
+    /// Convenience truthiness check. Equivalent to
+    /// `getFeatureFlag(key)?.isTruthy ?? false`, but goes through the Rust
+    /// core's optimized path which honours its own truthiness rules
+    /// (variant strings except `""` and `"false"` are truthy).
+    public func isFeatureEnabled(_ key: String) -> Bool {
+        guard let core = lockedCoreIfInitialized() else { return false }
+        do {
+            return try core.isFeatureEnabled(flagKey: key)
+        } catch {
+            reportError(method: "isFeatureEnabled", error: Self.mapError(error))
+            return false
+        }
+    }
+
+    /// Snapshot of every known flag and its current value.
+    ///
+    /// Does NOT emit `$feature_flag_called` events for any flag — call
+    /// `getFeatureFlag(_:)` to record an exposure for the specific flag your
+    /// code branches on.
+    public func getAllFlags() -> [String: FeatureFlagValue] {
+        guard let core = lockedCoreIfInitialized() else { return [:] }
+        do {
+            let json = try core.getAllFlagsJson()
+            return Self.parseAllFlags(json: json)
+        } catch {
+            reportError(method: "getAllFlags", error: Self.mapError(error))
+            return [:]
+        }
+    }
+
+    /// Override person properties used for flag evaluation.
+    ///
+    /// Replaces (does not merge) the SDK's flag-evaluation property map. To
+    /// merge instead, call `getAllFlags()` semantics aren't affected by
+    /// existing user identity — properties set here are evaluated locally
+    /// against rollout / cohort conditions.
+    @discardableResult
+    public func setPersonPropertiesForFlags(_ properties: [String: Any]) -> SafeResult<Void> {
+        guard let core = lockedCoreIfInitialized() else {
+            return .failure(.notInitialized)
+        }
+        do {
+            try core.setPersonPropertiesForFlags(propertiesJson: Self.jsonString(from: properties) ?? "{}")
+            return .success(())
+        } catch {
+            let mapped = Self.mapError(error)
+            reportError(method: "setPersonPropertiesForFlags", error: mapped)
+            return .failure(mapped)
+        }
+    }
+
+    /// Drop the cached flag definitions and re-fetch from the next `/config`
+    /// poll. Returns when the reload has completed (the actual fetch happens
+    /// on the existing config-poll timer, but the cache is cleared
+    /// synchronously and the reload status is reported).
+    ///
+    /// Throws if the SDK is not initialized or if the underlying call fails.
+    @discardableResult
+    public func reloadFeatureFlags() async throws -> Bool {
+        guard lockedCoreIfInitialized() != nil else {
+            throw LayersError.notInitialized
+        }
+        // Hop to a background queue so we don't block the caller. We capture
+        // `self` (singleton, @unchecked Sendable) — the core is held inside
+        // and re-fetched via lockedCoreIfInitialized to avoid the shutdown
+        // race.
+        let dropped: Bool = try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                guard let self = self, let core = self.lockedCoreIfInitialized() else {
+                    continuation.resume(throwing: LayersError.notInitialized)
+                    return
+                }
+                do {
+                    let result = try core.reloadFeatureFlags()
+                    continuation.resume(returning: result)
+                } catch {
+                    continuation.resume(throwing: Self.mapError(error))
+                }
+            }
+        }
+        if dropped {
+            // Reload dropped definitions — fire listeners so callers can
+            // re-render with the new flag state once the next poll lands.
+            fireFeatureFlagListeners()
+        }
+        return dropped
+    }
+
+    /// Register a listener that fires whenever the feature-flag set changes —
+    /// after `setFeatureFlagBootstrap`, after a successful
+    /// `reloadFeatureFlags()`, and (in future) after each remote config refresh.
+    ///
+    /// The listener is called with the current snapshot of flags. Use the
+    /// returned closure to unregister.
+    ///
+    /// ```swift
+    /// let dispose = Layers.shared.onFeatureFlags { flags in
+    ///     showCheckoutVariant(flags["new_checkout"]?.isTruthy ?? false)
+    /// }
+    /// // Later:
+    /// dispose()
+    /// ```
+    @discardableResult
+    public func onFeatureFlags(_ callback: @escaping ([String: FeatureFlagValue]) -> Void) -> () -> Void {
+        lock.lock()
+        _featureFlagListenerNextId &+= 1
+        let id = _featureFlagListenerNextId
+        _featureFlagListeners[id] = callback
+        lock.unlock()
+
+        // Fire once with the current snapshot if the SDK is already up.
+        let snapshot = getAllFlags()
+        if !snapshot.isEmpty {
+            callback(snapshot)
+        }
+
+        return { [weak self] in
+            guard let self = self else { return }
+            self.lock.lock()
+            self._featureFlagListeners.removeValue(forKey: id)
+            self.lock.unlock()
+        }
+    }
+
+    // MARK: - Internal Feature-Flag Helpers
+
+    /// Snapshot all listeners and call them with the current flag map.
+    /// Always uses `getAllFlags()` so each listener sees a consistent view.
+    func fireFeatureFlagListeners() {
+        lock.lock()
+        let listeners = Array(_featureFlagListeners.values)
+        lock.unlock()
+        if listeners.isEmpty { return }
+        let snapshot = getAllFlags()
+        for listener in listeners {
+            listener(snapshot)
+        }
+    }
+
+    /// Parse the JSON object returned by `getAllFlagsJson` into a strongly-typed
+    /// dictionary. Internal so unit tests can validate the parser independently
+    /// of the Rust core round-trip.
+    static func parseAllFlags(json: String) -> [String: FeatureFlagValue] {
+        guard let data = json.data(using: .utf8),
+              let raw = try? JSONSerialization.jsonObject(with: data, options: []) as? [String: Any]
+        else {
+            return [:]
+        }
+        var result: [String: FeatureFlagValue] = [:]
+        for (key, value) in raw {
+            if let b = value as? Bool {
+                result[key] = .boolean(b)
+            } else if let n = value as? NSNumber {
+                // Bool bridges to NSNumber as kCFBooleanTrue/False; the
+                // `as? Bool` above usually catches it, but Swift's bridging
+                // can route through NSNumber on older runtimes.
+                if CFGetTypeID(n) == CFBooleanGetTypeID() {
+                    result[key] = .boolean(n.boolValue)
+                }
+            } else if let s = value as? String {
+                result[key] = .string(s)
+            }
+        }
+        return result
     }
 
     // MARK: - User Identity
@@ -719,8 +1132,358 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
         return Int(core.queueDepth())
     }
 
-    // MARK: - Consent
+    /// Stable per-install device identifier. Sent alongside `appUserId` after
+    /// `identify()` so the server can stitch anonymous and identified activity.
+    /// Rotated by `reset()`.
+    public var deviceId: String? {
+        guard let core = lockedCoreIfInitialized() else { return nil }
+        return core.getDeviceId()
+    }
 
+    /// Monotonically-increasing session counter persisted across launches.
+    public var sessionNumber: UInt32 {
+        guard let core = lockedCoreIfInitialized() else { return 0 }
+        return core.getSessionNumber()
+    }
+
+    /// ISO-8601 timestamp of the SDK's first launch on this install. `nil`
+    /// until the SDK has run at least once.
+    public var firstOpenTime: String? {
+        guard let core = lockedCoreIfInitialized() else { return nil }
+        return core.getFirstOpenTime()
+    }
+
+    // MARK: - Super-properties (Tier 1)
+
+    /// Register one or more super-properties. Super-properties are merged into
+    /// every subsequent `track()` and `screen()` call. Caller's per-event
+    /// properties always win on key collisions.
+    @discardableResult
+    public func setSuperProperties(_ properties: [String: Any]) -> SafeResult<Void> {
+        guard let core = lockedCoreIfInitialized() else {
+            let err = LayersError.notInitialized
+            reportError(method: "setSuperProperties", error: err)
+            return .failure(err)
+        }
+        do {
+            try core.setSuperProperties(propertiesJson: Self.jsonString(from: properties) ?? "{}")
+            return .success(())
+        } catch {
+            let mapped = Self.mapError(error)
+            reportError(method: "setSuperProperties", error: mapped)
+            return .failure(mapped)
+        }
+    }
+
+    /// Register super-properties only if they have not been registered before.
+    /// Useful for initial-touch attribution snapshots (`initial_referrer`,
+    /// `initial_utm_source`, `initial_gclid`, …).
+    @discardableResult
+    public func setSuperPropertiesOnce(_ properties: [String: Any]) -> SafeResult<Void> {
+        guard let core = lockedCoreIfInitialized() else {
+            let err = LayersError.notInitialized
+            reportError(method: "setSuperPropertiesOnce", error: err)
+            return .failure(err)
+        }
+        do {
+            try core.setSuperPropertiesOnce(propertiesJson: Self.jsonString(from: properties) ?? "{}")
+            return .success(())
+        } catch {
+            let mapped = Self.mapError(error)
+            reportError(method: "setSuperPropertiesOnce", error: mapped)
+            return .failure(mapped)
+        }
+    }
+
+    /// Remove a single super-property by key. The key remains "once-locked"
+    /// (i.e. `setSuperPropertiesOnce` continues to skip it). Use
+    /// `clearSuperProperties()` for a full reset.
+    @discardableResult
+    public func unregisterSuperProperty(_ key: String) -> SafeResult<Void> {
+        guard let core = lockedCoreIfInitialized() else {
+            let err = LayersError.notInitialized
+            reportError(method: "unregisterSuperProperty", error: err)
+            return .failure(err)
+        }
+        do {
+            try core.unregisterSuperProperty(key: key)
+            return .success(())
+        } catch {
+            let mapped = Self.mapError(error)
+            reportError(method: "unregisterSuperProperty", error: mapped)
+            return .failure(mapped)
+        }
+    }
+
+    /// Clear ALL super-properties and the once-keys history.
+    @discardableResult
+    public func clearSuperProperties() -> SafeResult<Void> {
+        guard let core = lockedCoreIfInitialized() else {
+            let err = LayersError.notInitialized
+            reportError(method: "clearSuperProperties", error: err)
+            return .failure(err)
+        }
+        do {
+            try core.clearSuperProperties()
+            return .success(())
+        } catch {
+            let mapped = Self.mapError(error)
+            reportError(method: "clearSuperProperties", error: mapped)
+            return .failure(mapped)
+        }
+    }
+
+    /// Snapshot the registered super-properties as a `[String: Any]`.
+    public var superProperties: [String: Any] {
+        guard let core = lockedCoreIfInitialized() else { return [:] }
+        let json = core.getSuperPropertiesJson()
+        guard let data = json.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return [:] }
+        return obj
+    }
+
+    // MARK: - Timed events (Tier 1)
+
+    /// Start a duration timer for the next `track(eventName, ...)` call. When
+    /// that matching event is tracked, the elapsed milliseconds are
+    /// auto-attached as `$duration_ms` (Mixpanel-compatible).
+    @discardableResult
+    public func timeEvent(_ eventName: String) -> SafeResult<Void> {
+        guard let core = lockedCoreIfInitialized() else {
+            let err = LayersError.notInitialized
+            reportError(method: "timeEvent", error: err)
+            return .failure(err)
+        }
+        do {
+            try core.timeEvent(eventName: eventName)
+            return .success(())
+        } catch {
+            let mapped = Self.mapError(error)
+            reportError(method: "timeEvent", error: mapped)
+            return .failure(mapped)
+        }
+    }
+
+    /// Cancel a previously-started timer without emitting it. Returns the
+    /// elapsed milliseconds if a timer was active, `0` otherwise.
+    @discardableResult
+    public func cancelTimedEvent(_ eventName: String) -> UInt64 {
+        guard let core = lockedCoreIfInitialized() else { return 0 }
+        return core.cancelTimedEvent(eventName: eventName)
+    }
+
+    // MARK: - Multi-group (Tier 1)
+
+    /// Set the membership for a single `groupType`, overwriting any existing
+    /// value for that type. Subsequent events will carry the `$groups` map.
+    /// Pass an empty `groupId` to remove the type.
+    @discardableResult
+    public func setGroup(_ groupType: String, _ groupId: String) -> SafeResult<Void> {
+        guard let core = lockedCoreIfInitialized() else {
+            let err = LayersError.notInitialized
+            reportError(method: "setGroup", error: err)
+            return .failure(err)
+        }
+        do {
+            try core.setGroup(groupType: groupType, groupId: groupId)
+            return .success(())
+        } catch {
+            let mapped = Self.mapError(error)
+            reportError(method: "setGroup", error: mapped)
+            return .failure(mapped)
+        }
+    }
+
+    /// Add a group membership without overwriting other types (alias for `setGroup`).
+    @discardableResult
+    public func addGroup(_ groupType: String, _ groupId: String) -> SafeResult<Void> {
+        guard let core = lockedCoreIfInitialized() else {
+            let err = LayersError.notInitialized
+            reportError(method: "addGroup", error: err)
+            return .failure(err)
+        }
+        do {
+            try core.addGroup(groupType: groupType, groupId: groupId)
+            return .success(())
+        } catch {
+            let mapped = Self.mapError(error)
+            reportError(method: "addGroup", error: mapped)
+            return .failure(mapped)
+        }
+    }
+
+    /// Remove a single `groupType` from the membership map.
+    @discardableResult
+    public func removeGroup(_ groupType: String) -> SafeResult<Void> {
+        guard let core = lockedCoreIfInitialized() else {
+            let err = LayersError.notInitialized
+            reportError(method: "removeGroup", error: err)
+            return .failure(err)
+        }
+        do {
+            try core.removeGroup(groupType: groupType)
+            return .success(())
+        } catch {
+            let mapped = Self.mapError(error)
+            reportError(method: "removeGroup", error: mapped)
+            return .failure(mapped)
+        }
+    }
+
+    /// Snapshot the current `$groups` membership map.
+    public var groups: [String: String] {
+        guard let core = lockedCoreIfInitialized() else { return [:] }
+        do {
+            let json = try core.getGroupsJson()
+            guard let data = json.data(using: .utf8),
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: String]
+            else { return [:] }
+            return obj
+        } catch {
+            return [:]
+        }
+    }
+
+    // MARK: - User-property mutators (Tier 1)
+
+    /// Increment a numeric user property by `delta` (negative decrements).
+    /// Maps to the server-side `$add` verb. Non-finite deltas are rejected.
+    @discardableResult
+    public func increment(_ key: String, by delta: Double) -> SafeResult<Void> {
+        guard let core = lockedCoreIfInitialized() else {
+            let err = LayersError.notInitialized
+            reportError(method: "increment", error: err)
+            return .failure(err)
+        }
+        do {
+            try core.increment(key: key, delta: delta)
+            return .success(())
+        } catch {
+            let mapped = Self.mapError(error)
+            reportError(method: "increment", error: mapped)
+            return .failure(mapped)
+        }
+    }
+
+    /// Append a value to a list-valued user property. Maps to `$append`.
+    @discardableResult
+    public func append(_ key: String, value: Any) -> SafeResult<Void> {
+        guard let core = lockedCoreIfInitialized() else {
+            let err = LayersError.notInitialized
+            reportError(method: "append", error: err)
+            return .failure(err)
+        }
+        guard let valueJson = Self.jsonFragmentString(from: value) else {
+            let err = LayersError.unknown("append value not JSON-encodable")
+            reportError(method: "append", error: err)
+            return .failure(err)
+        }
+        do {
+            try core.append(key: key, valueJson: valueJson)
+            return .success(())
+        } catch {
+            let mapped = Self.mapError(error)
+            reportError(method: "append", error: mapped)
+            return .failure(mapped)
+        }
+    }
+
+    /// Union an array of values into a list-valued user property. Maps to `$union`.
+    /// Duplicates are removed server-side.
+    @discardableResult
+    public func union(_ key: String, values: [Any]) -> SafeResult<Void> {
+        guard let core = lockedCoreIfInitialized() else {
+            let err = LayersError.notInitialized
+            reportError(method: "union", error: err)
+            return .failure(err)
+        }
+        guard JSONSerialization.isValidJSONObject(values),
+              let data = try? JSONSerialization.data(withJSONObject: values),
+              let valuesJson = String(data: data, encoding: .utf8)
+        else {
+            let err = LayersError.unknown( "union values not JSON-encodable")
+            reportError(method: "union", error: err)
+            return .failure(err)
+        }
+        do {
+            try core.union(key: key, valuesJson: valuesJson)
+            return .success(())
+        } catch {
+            let mapped = Self.mapError(error)
+            reportError(method: "union", error: mapped)
+            return .failure(mapped)
+        }
+    }
+
+    /// Remove a user property. Maps to `$unset`.
+    @discardableResult
+    public func unset(_ key: String) -> SafeResult<Void> {
+        guard let core = lockedCoreIfInitialized() else {
+            let err = LayersError.notInitialized
+            reportError(method: "unset", error: err)
+            return .failure(err)
+        }
+        do {
+            try core.unset(key: key)
+            return .success(())
+        } catch {
+            let mapped = Self.mapError(error)
+            reportError(method: "unset", error: mapped)
+            return .failure(mapped)
+        }
+    }
+
+    // MARK: - before_send filter hook (Tier 1)
+
+    /// Adapter that forwards UniFFI callbacks to a Swift closure.
+    private final class BeforeSendCallbackAdapter: UniFfiBeforeSendCallback {
+        private let handler: (String) -> String?
+        init(handler: @escaping (String) -> String?) {
+            self.handler = handler
+        }
+        func onEvent(eventJson: String) -> String? {
+            handler(eventJson)
+        }
+    }
+
+    /// Register a `before_send` filter callback. The callback receives every
+    /// event as a JSON string before it is queued. Return:
+    /// - the (possibly modified) JSON string to keep / mutate the event
+    /// - `nil` to drop the event
+    ///
+    /// Callback errors that throw or crash are treated as "drop" (fail-closed).
+    public func setBeforeSend(_ handler: @escaping (String) -> String?) {
+        guard let core = lockedCoreIfInitialized() else { return }
+        let adapter = BeforeSendCallbackAdapter(handler: handler)
+        core.setBeforeSend(callback: adapter)
+    }
+
+    /// Remove the registered `before_send` filter.
+    public func clearBeforeSend() {
+        guard let core = lockedCoreIfInitialized() else { return }
+        core.clearBeforeSend()
+    }
+
+    /// The per-device DebugView token, or `nil` if `debug` was not enabled in
+    /// the config passed to ``initialize(config:)``.
+    ///
+    /// When debug mode is on, the SDK persists this UUID alongside the
+    /// identity record so the same token is reused across launches; that token
+    /// is also sent in the `X-Debug-Token` header on every request to the
+    /// ingest server. Surface it in dev UIs so operators can filter the
+    /// dashboard's live tail to events from this device only.
+    public var debugToken: String? {
+        guard let core = lockedCoreIfInitialized() else { return nil }
+        return core.debugToken()
+    }
+
+    // MARK: - Consent (Firebase Consent Mode v2)
+
+    /// Update consent across the four Consent Mode v2 categories.
+    ///
+    /// On a Denied → Granted transition for `analyticsStorage`, the Rust core
+    /// auto-drains queued events.
     @discardableResult
     public func setConsent(_ consent: ConsentSettings) -> SafeResult<Void> {
         guard let core = lockedCoreIfInitialized() else {
@@ -729,12 +1492,23 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
             return .failure(err)
         }
         if enableDebug {
-            os_log("setConsent(analytics: %{public}@, advertising: %{public}@)", log: Self.log, type: .debug, String(describing: consent.analytics), String(describing: consent.advertising))
+            os_log(
+                "setConsent(analyticsStorage: %{public}@, adStorage: %{public}@, adUserData: %{public}@, adPersonalization: %{public}@)",
+                log: Self.log, type: .debug,
+                String(describing: consent.analyticsStorage),
+                String(describing: consent.adStorage),
+                String(describing: consent.adUserData),
+                String(describing: consent.adPersonalization)
+            )
         }
         do {
             try core.setConsent(consent: UniFfiConsent(
-                analytics: consent.analytics,
-                advertising: consent.advertising
+                analyticsStorage: consent.analyticsStorage,
+                adStorage: consent.adStorage,
+                adUserData: consent.adUserData,
+                adPersonalization: consent.adPersonalization,
+                analytics: nil,
+                advertising: nil
             ))
             return .success(())
         } catch {
@@ -1210,6 +1984,13 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
     /// Note: This performs two separate calls to the core (clear identity, clear user properties).
     /// If the first succeeds but the second fails, the SDK may be in a partially-reset state.
     /// The returned result reflects the first failure encountered.
+    /// Clear the SDK identity:
+    /// - drops the `appUserId` set via `identify()`
+    /// - rotates `device_id` and `anonymous_id` (server-side identity stitching uses both)
+    /// - clears all super-properties registered via `setSuperProperties{Once}`
+    /// - clears all multi-group memberships set via `setGroup` / `addGroup`
+    /// - drops in-flight queued events (they belonged to the prior identity)
+    /// - resets screen breadcrumbs and timed-event timers
     @discardableResult
     public func reset() -> SafeResult<Void> {
         guard let core = lockedCoreIfInitialized() else {
@@ -1221,8 +2002,7 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
             os_log("reset()", log: Self.log, type: .debug)
         }
         do {
-            try core.identify(userId: "")
-            try core.setUserProperties(propertiesJson: "{}")
+            try core.reset()
             lock.lock()
             _appUserId = nil
             lock.unlock()
@@ -1266,6 +2046,17 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
             }
             lock.unlock()
             #endif
+
+            // Tear down Tier 2 auto-capture modules.
+            lifecycle.detach()
+            screenTracking.detach()
+            #if canImport(StoreKit)
+            if #available(iOS 15.0, macOS 13.0, tvOS 15.0, watchOS 8.0, *) {
+                commerce.stopAutomaticPurchaseTracking()
+            }
+            #endif
+            commerce.detach()
+
             // Clear Retry-After gate
             clearRetryAfter()
 
@@ -1286,6 +2077,7 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
             _configBaseUrl = nil
             _recentEvents = []
             _lastFlushResult = nil
+            _featureFlagListeners.removeAll()
             lock.unlock()
 
             #if canImport(UIKit) && !os(watchOS)
@@ -1828,7 +2620,51 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
             props["clipboard_attribution_url"] = clipboardUrl
         }
 
-        let json = Self.jsonString(from: props)
+        // First launch with no prior attribution signal: ask the server to
+        // resolve us via device fingerprint against recent /c/:appId clicks.
+        // Run the HTTP + wait entirely on a background queue so the caller's
+        // thread (commonly the main thread during SDK init) never blocks —
+        // blocking the main thread risks the iOS watchdog timer. We emit
+        // app_install / app_open from that background queue AFTER the resolve
+        // completes (or times out) so the CAPI events carry the recovered
+        // click IDs on first launch, which is the entire point of this path.
+        let needsResolve: Bool = {
+            if !isFirstLaunch { return false }
+            lock.lock()
+            defer { lock.unlock() }
+            return _attributionFbclid == nil
+                && _attributionGclid == nil
+                && _attributionTtclid == nil
+                && _attributionMsclkid == nil
+        }()
+
+        if needsResolve {
+            let baseProps = props
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                guard let self = self else { return }
+                self.resolveClickFromFingerprintBlocking(timeout: 3.0)
+                self.emitAttributionTrackEvents(core: core, baseProps: baseProps, isFirstLaunch: true)
+            }
+            return
+        }
+
+        emitAttributionTrackEvents(core: core, baseProps: props, isFirstLaunch: isFirstLaunch)
+    }
+
+    /// Merge current attribution state into `baseProps` and emit the
+    /// first-launch `app_install` and `app_open` events. Factored out so
+    /// both the sync path (no resolve needed) and the async resolve path
+    /// share one implementation.
+    private func emitAttributionTrackEvents(
+        core: LayersCoreHandle,
+        baseProps: [String: Any],
+        isFirstLaunch: Bool
+    ) {
+        // Merge any attribution state (including click IDs recovered by
+        // resolveClickFromFingerprintBlocking) so the Rust core's track
+        // call sees the complete props map.
+        let mergedProps = mergeAttributionProperties(baseProps)
+        let json = Self.jsonString(from: mergedProps)
         // Send app_install before app_open on first launch for CAPI forwarding
         if isFirstLaunch {
             do {
@@ -1852,6 +2688,22 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
         } catch {
             os_log("app_open attribution track failed: %{public}@", log: Self.log, type: .error, error.localizedDescription)
         }
+    }
+
+    /// Serialize a single JSON-compatible value (string, number, bool, null,
+    /// array, object) to its canonical JSON encoding. Used by op-verb wrappers
+    /// like `append` that pass a single value across the FFI boundary.
+    static func jsonFragmentString(from value: Any) -> String? {
+        // .fragmentsAllowed (iOS 13+/macOS 10.15+) accepts top-level primitives.
+        guard let data = try? JSONSerialization.data(
+            withJSONObject: value,
+            options: [.fragmentsAllowed]
+        ),
+              let str = String(data: data, encoding: .utf8)
+        else {
+            return nil
+        }
+        return str
     }
 
     static func jsonString(from dict: [String: Any]) -> String? {
@@ -1927,6 +2779,127 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
         URLSession.shared.dataTask(with: request) { _, _, _ in
             // Best-effort — don't throw on network errors
         }.resume()
+    }
+
+    /// POST a device fingerprint to /clicks/resolve so the server can match
+    /// this first-launch install to a recent /c/:appId click captured in
+    /// Safari before the App Store redirect.
+    ///
+    /// On a successful match, persist the returned click IDs via
+    /// setAttributionData so every subsequent event carries fbclid / gclid /
+    /// ttclid / msclkid. This is the primary iOS web-to-app attribution path
+    /// since iOS has no equivalent of Android's Play Install Referrer.
+    ///
+    /// Blocks the caller up to `timeout` seconds on the first launch so the
+    /// immediately-following `app_install` CAPI event can already carry the
+    /// recovered click ID. On timeout, attribution simply won't be present on
+    /// this exact event — subsequent events will still carry it when the
+    /// URLSession response eventually lands and calls setAttributionData
+    /// (we keep a background completion handler for that path).
+    private func resolveClickFromFingerprintBlocking(timeout: TimeInterval) {
+        lock.lock()
+        let appId = _configAppId
+        let baseUrlConfig = _configBaseUrl
+        let lastCtx = _lastDeviceContext
+        lock.unlock()
+
+        guard let appId = appId else { return }
+
+        let baseUrl = (baseUrlConfig ?? Self.defaultBaseUrl)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        guard let url = URL(string: "\(baseUrl)/clicks/resolve") else { return }
+
+        // Intentionally no client-supplied timestamp — the server anchors the
+        // /clicks/resolve lookback window to its own now() to prevent callers
+        // from scanning historical clicks with crafted past timestamps.
+        var payload: [String: Any] = [
+            "app_id": appId,
+            "platform": "ios",
+            "timezone": TimeZone.current.identifier,
+            "locale": Locale.current.identifier
+        ]
+        if let ctx = lastCtx {
+            if let deviceModel = ctx.deviceModel { payload["device_model"] = deviceModel }
+            if let osVersion = ctx.osVersion { payload["os_version"] = osVersion }
+            if let screenSize = ctx.screenSize { payload["screen_size"] = screenSize }
+        }
+
+        guard let bodyData = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]) else {
+            return
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.httpBody = bodyData
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(appId, forHTTPHeaderField: "X-App-Id")
+        request.setValue("swift/\(Self.sdkVersionString())", forHTTPHeaderField: "X-SDK-Version")
+        request.timeoutInterval = timeout
+
+        // Block the caller briefly (up to `timeout`) with a semaphore so the
+        // immediately-following app_install track can carry the recovered
+        // fbclid. If the response lands after the wait expires we still
+        // apply it — subsequent purchase_success etc. will carry it — but
+        // the initial CAPI install event may miss it in that edge case.
+        let sema = DispatchSemaphore(value: 0)
+        let task = URLSession.shared.dataTask(with: request) { [weak self] data, response, _ in
+            defer { sema.signal() }
+            guard let self = self else { return }
+            guard let httpResp = response as? HTTPURLResponse, httpResp.statusCode == 200 else { return }
+            guard let data = data else { return }
+
+            do {
+                guard
+                    let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                    let success = json["success"] as? Bool, success,
+                    let dataDict = json["data"] as? [String: Any],
+                    let matched = dataDict["matched"] as? Bool, matched
+                else { return }
+
+                let fbclid = dataDict["fbclid"] as? String
+                let gclid = dataDict["gclid"] as? String
+                let ttclid = dataDict["ttclid"] as? String
+                let msclkid = dataDict["msclkid"] as? String
+
+                guard fbclid != nil || gclid != nil || ttclid != nil || msclkid != nil else { return }
+
+                // Merge with existing state so we don't clobber prior values.
+                self.lock.lock()
+                let existingDeeplinkId = self._attributionDeeplinkId
+                let existingGclid = self._attributionGclid
+                let existingFbclid = self._attributionFbclid
+                let existingTtclid = self._attributionTtclid
+                let existingMsclkid = self._attributionMsclkid
+                self.lock.unlock()
+
+                _ = self.setAttributionData(
+                    deeplinkId: existingDeeplinkId,
+                    gclid: gclid ?? existingGclid,
+                    fbclid: fbclid ?? existingFbclid,
+                    ttclid: ttclid ?? existingTtclid,
+                    msclkid: msclkid ?? existingMsclkid
+                )
+
+                if self.enableDebug {
+                    os_log(
+                        "clicks/resolve matched fbclid=%{public}@ gclid=%{public}@ ttclid=%{public}@",
+                        log: Self.log,
+                        type: .debug,
+                        String(describing: fbclid),
+                        String(describing: gclid),
+                        String(describing: ttclid)
+                    )
+                }
+            } catch {
+                // best-effort — swallow JSON/decoding errors
+            }
+        }
+        task.resume()
+        // Wait up to `timeout` seconds for the response to land and
+        // setAttributionData to complete. Timeout is silently accepted —
+        // the task keeps running in the background and later events still
+        // pick up the click IDs via setAttributionData.
+        _ = sema.wait(timeout: .now() + timeout)
     }
 
     /// Return the current timestamp in ISO 8601 format.
@@ -2085,12 +3058,15 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
         let sid = (try? core?.getSessionId()) ?? nil
         let depth = core.map { Int($0.queueDepth()) }
 
-        // Consent state
+        // Consent state (Tier 9 / Consent Mode v2): show the v2 fields,
+        // falling back to legacy fields if a wrapper still uses them.
         let consentAnalytics: String
         let consentAdvertising: String
         if let consent = try? core?.getConsentState() {
-            consentAnalytics = consent.analytics.map { $0 ? "yes" : "no" } ?? "unset"
-            consentAdvertising = consent.advertising.map { $0 ? "yes" : "no" } ?? "unset"
+            consentAnalytics = (consent.analyticsStorage ?? consent.analytics)
+                .map { $0 ? "yes" : "no" } ?? "unset"
+            consentAdvertising = (consent.adStorage ?? consent.advertising)
+                .map { $0 ? "yes" : "no" } ?? "unset"
         } else {
             consentAnalytics = "--"
             consentAdvertising = "--"

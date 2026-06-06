@@ -446,6 +446,22 @@ private struct FfiConverterUInt64: FfiConverterPrimitive {
 #if swift(>=5.8)
     @_documentation(visibility: private)
 #endif
+private struct FfiConverterDouble: FfiConverterPrimitive {
+    typealias FfiType = Double
+    typealias SwiftType = Double
+
+    static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Double {
+        return try lift(readDouble(&buf))
+    }
+
+    static func write(_ value: Double, into buf: inout [UInt8]) {
+        writeDouble(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
 private struct FfiConverterBool: FfiConverter {
     typealias FfiType = Int8
     typealias SwiftType = Bool
@@ -517,9 +533,36 @@ private struct FfiConverterString: FfiConverter {
  */
 public protocol LayersCoreHandleProtocol: AnyObject {
     /**
+     * Add a group membership (alias for `set_group`).
+     */
+    func addGroup(groupType: String, groupId: String) throws
+
+    /**
+     * Append a value to a list-valued user property (server-side `$append`).
+     * `value_json` is a JSON-encoded scalar/array/object.
+     */
+    func append(key: String, valueJson: String) throws
+
+    /**
+     * Cancel a previously-started timer without emitting it. Returns the
+     * elapsed milliseconds if a timer was active, 0 otherwise.
+     */
+    func cancelTimedEvent(eventName: String) -> UInt64
+
+    /**
+     * Clear the `before_send` filter callback.
+     */
+    func clearBeforeSend()
+
+    /**
      * Clear the Retry-After gate (e.g. after a successful flush).
      */
     func clearRetryAfter()
+
+    /**
+     * Clear all super-properties and the once-keys history.
+     */
+    func clearSuperProperties() throws
 
     /**
      * Return the current ETag for conditional config requests.
@@ -538,6 +581,18 @@ public protocol LayersCoreHandleProtocol: AnyObject {
      * Return the full URL for the remote config endpoint.
      */
     func configUrl() throws -> String
+
+    /**
+     * Return the per-device DebugView token, or `None` if `config.debug` was
+     * not enabled at init.
+     *
+     * When debug mode is on, the SDK persists this UUID alongside the
+     * identity record so the same token is reused across restarts. The
+     * token is also included in the `X-Debug-Token` header on every
+     * request to the ingest server, letting dashboards filter the live
+     * tail to events from this device only.
+     */
+    func debugToken() -> String?
 
     /**
      * Drain up to `count` events from the queue as a serialized EventBatch
@@ -566,6 +621,12 @@ public protocol LayersCoreHandleProtocol: AnyObject {
     func flush() throws
 
     /**
+     * Returns true when the privacy gates allow analytics flushing/POSTing.
+     * Wrappers can poll this to decide whether to attempt HTTP delivery.
+     */
+    func flushAllowed() -> Bool
+
+    /**
      * Return the HTTP headers for an event batch POST as a JSON string.
      * The JSON is an array of [key, value] pairs, e.g.:
      * `[["Content-Type","application/json"],["X-Api-Key","..."]]`
@@ -573,9 +634,70 @@ public protocol LayersCoreHandleProtocol: AnyObject {
     func flushHeadersJson() throws -> String
 
     /**
+     * Return surveys currently eligible to show.
+     *
+     * `targeting_context_json` is a JSON object with shape:
+     * ```json
+     * {
+     * "url": "string?",
+     * "person_properties": { ... },
+     * "feature_flag_values": { "flag_key": true/false, ... },
+     * "event_counts": { "event_name": 5, ... }
+     * }
+     * ```
+     * Returns the matching survey definitions as a JSON array string.
+     * Returns an empty array (`[]`) when consent is denied.
+     */
+    func getActiveSurveysJson(targetingContextJson: String?) throws -> String
+
+    /**
+     * Snapshot every known flag's current value as a JSON object (key -> value).
+     * Does NOT emit exposure events.
+     */
+    func getAllFlagsJson() throws -> String
+
+    /**
+     * Read the current `anonymous_id`.
+     */
+    func getAnonymousId() -> String?
+
+    /**
      * Get the current consent state.
      */
     func getConsentState() throws -> UniFfiConsent
+
+    /**
+     * Read the current `device_id`.
+     */
+    func getDeviceId() -> String?
+
+    /**
+     * Evaluate a feature flag. Returns the value as a JSON string:
+     * - `"true"` / `"false"` for binary flags
+     * - `"\"variant_key\""` for multivariate flags
+     * - `"null"` if the flag is unknown
+     *
+     * Side effect: emits one `$feature_flag_called` event per
+     * (flag_key, response) pair per session. Subsequent calls with the same
+     * response are deduplicated.
+     */
+    func getFeatureFlagJson(flagKey: String) throws -> String
+
+    /**
+     * Look up the JSON payload attached to a flag. Returns `null` if the
+     * flag has no payload. Does NOT emit `$feature_flag_called`.
+     */
+    func getFeatureFlagPayloadJson(flagKey: String) throws -> String
+
+    /**
+     * Read the SDK's first-open timestamp (ISO 8601 string), or None.
+     */
+    func getFirstOpenTime() -> String?
+
+    /**
+     * Snapshot the current `$groups` membership as a JSON object string.
+     */
+    func getGroupsJson() throws -> String
 
     /**
      * Get remote config as JSON string, or None if not fetched yet.
@@ -586,6 +708,16 @@ public protocol LayersCoreHandleProtocol: AnyObject {
      * Get the current session ID.
      */
     func getSessionId() throws -> String
+
+    /**
+     * Read the current monotonic `session_number`.
+     */
+    func getSessionNumber() -> UInt32
+
+    /**
+     * Snapshot the registered super-properties as a JSON object string.
+     */
+    func getSuperPropertiesJson() -> String
 
     /**
      * Associate subsequent events with a group (company, team, organization).
@@ -600,6 +732,28 @@ public protocol LayersCoreHandleProtocol: AnyObject {
     func identify(userId: String) throws
 
     /**
+     * Increment a numeric user property by `delta` (server-side `$add`).
+     */
+    func increment(key: String, delta: Double) throws
+
+    /**
+     * Whether the SDK was configured with cookieless mode (web only).
+     */
+    func isCookielessMode() -> Bool
+
+    /**
+     * Read the current DNT-active signal.
+     */
+    func isDntActive() -> Bool
+
+    /**
+     * Returns true iff the flag is truthy. Convenience wrapper around
+     * `get_feature_flag_json`. Treats variant strings as truthy except `""`
+     * and `"false"`. Falls back to `false` for unknown flags.
+     */
+    func isFeatureEnabled(flagKey: String) throws -> Bool
+
+    /**
      * Check whether the SDK is still initialized (not shut down).
      */
     func isInitialized() -> Bool
@@ -610,10 +764,37 @@ public protocol LayersCoreHandleProtocol: AnyObject {
     func isRetryAfterActive() -> Bool
 
     /**
+     * Snapshot the list of currently-known flag keys.
+     */
+    func knownFeatureFlagKeys() -> [String]
+
+    /**
+     * Snapshot of all known survey ids (after `update_remote_config` has
+     * pulled definitions out of the config response).
+     */
+    func knownSurveyIds() -> [String]
+
+    /**
      * Mark config as not modified (304 response) — resets the TTL timer
      * without replacing the cached config.
      */
     func markConfigNotModified() throws
+
+    /**
+     * Mark a survey as dismissed — emits `survey dismissed` auto-event.
+     */
+    func markSurveyDismissed(surveyId: String) throws
+
+    /**
+     * Mark a survey as shown — emits `survey shown` auto-event and bumps
+     * the frequency-cap counter.
+     */
+    func markSurveyShown(surveyId: String) throws
+
+    /**
+     * Merge additional properties into the flag-evaluation override map.
+     */
+    func mergePersonPropertiesForFlags(propertiesJson: String) throws
 
     /**
      * Get the number of events in the queue.
@@ -621,10 +802,37 @@ public protocol LayersCoreHandleProtocol: AnyObject {
     func queueDepth() -> UInt32
 
     /**
+     * Clear cached flag definitions; the next `/config` fetch will repopulate.
+     * Returns `true` if any definitions were dropped.
+     */
+    func reloadFeatureFlags() throws -> Bool
+
+    /**
+     * Remove a single group_type from the membership map.
+     */
+    func removeGroup(groupType: String) throws
+
+    /**
      * Re-enqueue events at the front of the queue after a failed HTTP
      * delivery. Expects the same JSON array of events from drain_batch.
      */
     func requeueEvents(eventsJson: String) throws -> UInt32
+
+    /**
+     * Whether the SDK was configured to require explicit consent.
+     */
+    func requiresExplicitConsent() -> Bool
+
+    /**
+     * Clear identity: drops user_id, rotates device_id and anonymous_id,
+     * clears super-properties and groups, drops in-flight events.
+     */
+    func reset() throws
+
+    /**
+     * Whether the SDK was configured to respect Do-Not-Track signals.
+     */
+    func respectsDnt() -> Bool
 
     /**
      * Return the remaining Retry-After delay in milliseconds, or 0.
@@ -637,14 +845,70 @@ public protocol LayersCoreHandleProtocol: AnyObject {
     func screen(screenName: String, propertiesJson: String?, userId: String?, anonymousId: String?) throws
 
     /**
-     * Update consent state.
+     * Restore a previously snapshotted show-history map.
+     */
+    func seedSurveyShowHistory(historyJson: String) throws
+
+    /**
+     * Register a `before_send` filter callback. The callback receives the event as
+     * JSON and returns either the (possibly modified) event JSON, or `None` to drop.
+     */
+    func setBeforeSend(callback: UniFfiBeforeSendCallback)
+
+    /**
+     * Update consent state (Consent Mode v2).
+     *
+     * On Denied → Granted transition for `analytics_storage`, the SDK
+     * auto-drains queued events.
      */
     func setConsent(consent: UniFfiConsent) throws
+
+    /**
+     * DEPRECATED: legacy two-flag consent API. Wrappers should prefer
+     * `set_consent` with an explicit `UniFFIConsent` record.
+     */
+    func setConsentLegacy(analytics: Bool?, advertising: Bool?) throws
 
     /**
      * Set device context information.
      */
     func setDeviceContext(context: UniFfiDeviceContext) throws
+
+    /**
+     * Web wrappers call this to inform the core whether the browser DNT
+     * signal is currently active. Native wrappers should not call this
+     * (the platform has no equivalent OS-level signal).
+     */
+    func setDntSignal(dntActive: Bool)
+
+    /**
+     * Seed bootstrap values + payloads (for SSR / pre-render). The
+     * `bootstrap_json` argument should match the `BootstrapData` shape:
+     * `{ "feature_flags": {...}, "feature_flag_payloads": {...} }`.
+     */
+    func setFeatureFlagBootstrap(bootstrapJson: String) throws
+
+    /**
+     * Set membership for a single group_type. Pass empty string for `group_id` to remove.
+     */
+    func setGroup(groupType: String, groupId: String) throws
+
+    /**
+     * Override person properties used for flag evaluation only.
+     * `properties_json` must be a JSON object string.
+     */
+    func setPersonPropertiesForFlags(propertiesJson: String) throws
+
+    /**
+     * Register one or more super-properties (auto-merged into every track/screen).
+     * `properties_json` must be a JSON object string.
+     */
+    func setSuperProperties(propertiesJson: String) throws
+
+    /**
+     * Register super-properties only if they have not been registered before.
+     */
+    func setSuperPropertiesOnce(propertiesJson: String) throws
 
     /**
      * Set user properties. `properties_json` must be a JSON object string.
@@ -664,12 +928,55 @@ public protocol LayersCoreHandleProtocol: AnyObject {
     func shutdown() throws
 
     /**
+     * Submit a survey response — emits `survey sent` auto-event with the
+     * answers attached. `response_json` is a `SurveyResponse` JSON object.
+     */
+    func submitSurveyResponse(surveyId: String, responseJson: String) throws
+
+    /**
+     * Snapshot of all currently-cached survey definitions as a JSON array.
+     * Used by wrappers to discover targeting dependencies (e.g. feature
+     * flag references) without iterating active surveys, which would
+     * create a circular dependency with flag-gated surveys (a flag-gated
+     * survey can never be "active" until its flag has been resolved, but
+     * the wrapper only knows which flags to resolve by reading definitions).
+     */
+    func surveyDefinitionsJson() throws -> String
+
+    /**
+     * Snapshot of per-survey-id show timestamps for cross-restart persistence.
+     */
+    func surveyShowHistoryJson() throws -> String
+
+    /**
+     * Start a duration timer for the next `track(name, ...)` call. The
+     * resulting event will carry `$duration_ms`.
+     */
+    func timeEvent(eventName: String) throws
+
+    /**
      * Track a custom event.
      *
      * `properties_json` is a JSON string that will be parsed as a JSON object.
      * Pass `None` or `"{}"` for events with no properties.
      */
     func track(eventName: String, propertiesJson: String?, userId: String?, anonymousId: String?) throws
+
+    /**
+     * Union an array of values into a list-valued user property (server-side `$union`).
+     * `values_json` must be a JSON-encoded array.
+     */
+    func union(key: String, valuesJson: String) throws
+
+    /**
+     * Remove a single super-property by key. The key remains "once-locked".
+     */
+    func unregisterSuperProperty(key: String) throws
+
+    /**
+     * Remove a user property (server-side `$unset`).
+     */
+    func unset(key: String) throws
 
     /**
      * Update cached remote config from a fetched JSON string.
@@ -757,10 +1064,58 @@ open class LayersCoreHandle:
     }
 
     /**
+     * Add a group membership (alias for `set_group`).
+     */
+    open func addGroup(groupType: String, groupId: String) throws { try rustCallWithError(FfiConverterTypeUniFFIError.lift) {
+        uniffi_layers_core_fn_method_layerscorehandle_add_group(self.uniffiClonePointer(),
+                                                                FfiConverterString.lower(groupType),
+                                                                FfiConverterString.lower(groupId), $0)
+    }
+    }
+
+    /**
+     * Append a value to a list-valued user property (server-side `$append`).
+     * `value_json` is a JSON-encoded scalar/array/object.
+     */
+    open func append(key: String, valueJson: String) throws { try rustCallWithError(FfiConverterTypeUniFFIError.lift) {
+        uniffi_layers_core_fn_method_layerscorehandle_append(self.uniffiClonePointer(),
+                                                             FfiConverterString.lower(key),
+                                                             FfiConverterString.lower(valueJson), $0)
+    }
+    }
+
+    /**
+     * Cancel a previously-started timer without emitting it. Returns the
+     * elapsed milliseconds if a timer was active, 0 otherwise.
+     */
+    open func cancelTimedEvent(eventName: String) -> UInt64 {
+        return try! FfiConverterUInt64.lift(try! rustCall {
+            uniffi_layers_core_fn_method_layerscorehandle_cancel_timed_event(self.uniffiClonePointer(),
+                                                                             FfiConverterString.lower(eventName), $0)
+        })
+    }
+
+    /**
+     * Clear the `before_send` filter callback.
+     */
+    open func clearBeforeSend() { try! rustCall {
+        uniffi_layers_core_fn_method_layerscorehandle_clear_before_send(self.uniffiClonePointer(), $0)
+    }
+    }
+
+    /**
      * Clear the Retry-After gate (e.g. after a successful flush).
      */
     open func clearRetryAfter() { try! rustCall {
         uniffi_layers_core_fn_method_layerscorehandle_clear_retry_after(self.uniffiClonePointer(), $0)
+    }
+    }
+
+    /**
+     * Clear all super-properties and the once-keys history.
+     */
+    open func clearSuperProperties() throws { try rustCallWithError(FfiConverterTypeUniFFIError.lift) {
+        uniffi_layers_core_fn_method_layerscorehandle_clear_super_properties(self.uniffiClonePointer(), $0)
     }
     }
 
@@ -791,6 +1146,22 @@ open class LayersCoreHandle:
     open func configUrl() throws -> String {
         return try FfiConverterString.lift(rustCallWithError(FfiConverterTypeUniFFIError.lift) {
             uniffi_layers_core_fn_method_layerscorehandle_config_url(self.uniffiClonePointer(), $0)
+        })
+    }
+
+    /**
+     * Return the per-device DebugView token, or `None` if `config.debug` was
+     * not enabled at init.
+     *
+     * When debug mode is on, the SDK persists this UUID alongside the
+     * identity record so the same token is reused across restarts. The
+     * token is also included in the `X-Debug-Token` header on every
+     * request to the ingest server, letting dashboards filter the live
+     * tail to events from this device only.
+     */
+    open func debugToken() -> String? {
+        return try! FfiConverterOptionString.lift(try! rustCall {
+            uniffi_layers_core_fn_method_layerscorehandle_debug_token(self.uniffiClonePointer(), $0)
         })
     }
 
@@ -839,6 +1210,16 @@ open class LayersCoreHandle:
     }
 
     /**
+     * Returns true when the privacy gates allow analytics flushing/POSTing.
+     * Wrappers can poll this to decide whether to attempt HTTP delivery.
+     */
+    open func flushAllowed() -> Bool {
+        return try! FfiConverterBool.lift(try! rustCall {
+            uniffi_layers_core_fn_method_layerscorehandle_flush_allowed(self.uniffiClonePointer(), $0)
+        })
+    }
+
+    /**
      * Return the HTTP headers for an event batch POST as a JSON string.
      * The JSON is an array of [key, value] pairs, e.g.:
      * `[["Content-Type","application/json"],["X-Api-Key","..."]]`
@@ -850,11 +1231,107 @@ open class LayersCoreHandle:
     }
 
     /**
+     * Return surveys currently eligible to show.
+     *
+     * `targeting_context_json` is a JSON object with shape:
+     * ```json
+     * {
+     * "url": "string?",
+     * "person_properties": { ... },
+     * "feature_flag_values": { "flag_key": true/false, ... },
+     * "event_counts": { "event_name": 5, ... }
+     * }
+     * ```
+     * Returns the matching survey definitions as a JSON array string.
+     * Returns an empty array (`[]`) when consent is denied.
+     */
+    open func getActiveSurveysJson(targetingContextJson: String?) throws -> String {
+        return try FfiConverterString.lift(rustCallWithError(FfiConverterTypeUniFFIError.lift) {
+            uniffi_layers_core_fn_method_layerscorehandle_get_active_surveys_json(self.uniffiClonePointer(),
+                                                                                  FfiConverterOptionString.lower(targetingContextJson), $0)
+        })
+    }
+
+    /**
+     * Snapshot every known flag's current value as a JSON object (key -> value).
+     * Does NOT emit exposure events.
+     */
+    open func getAllFlagsJson() throws -> String {
+        return try FfiConverterString.lift(rustCallWithError(FfiConverterTypeUniFFIError.lift) {
+            uniffi_layers_core_fn_method_layerscorehandle_get_all_flags_json(self.uniffiClonePointer(), $0)
+        })
+    }
+
+    /**
+     * Read the current `anonymous_id`.
+     */
+    open func getAnonymousId() -> String? {
+        return try! FfiConverterOptionString.lift(try! rustCall {
+            uniffi_layers_core_fn_method_layerscorehandle_get_anonymous_id(self.uniffiClonePointer(), $0)
+        })
+    }
+
+    /**
      * Get the current consent state.
      */
     open func getConsentState() throws -> UniFfiConsent {
         return try FfiConverterTypeUniFFIConsent.lift(rustCallWithError(FfiConverterTypeUniFFIError.lift) {
             uniffi_layers_core_fn_method_layerscorehandle_get_consent_state(self.uniffiClonePointer(), $0)
+        })
+    }
+
+    /**
+     * Read the current `device_id`.
+     */
+    open func getDeviceId() -> String? {
+        return try! FfiConverterOptionString.lift(try! rustCall {
+            uniffi_layers_core_fn_method_layerscorehandle_get_device_id(self.uniffiClonePointer(), $0)
+        })
+    }
+
+    /**
+     * Evaluate a feature flag. Returns the value as a JSON string:
+     * - `"true"` / `"false"` for binary flags
+     * - `"\"variant_key\""` for multivariate flags
+     * - `"null"` if the flag is unknown
+     *
+     * Side effect: emits one `$feature_flag_called` event per
+     * (flag_key, response) pair per session. Subsequent calls with the same
+     * response are deduplicated.
+     */
+    open func getFeatureFlagJson(flagKey: String) throws -> String {
+        return try FfiConverterString.lift(rustCallWithError(FfiConverterTypeUniFFIError.lift) {
+            uniffi_layers_core_fn_method_layerscorehandle_get_feature_flag_json(self.uniffiClonePointer(),
+                                                                                FfiConverterString.lower(flagKey), $0)
+        })
+    }
+
+    /**
+     * Look up the JSON payload attached to a flag. Returns `null` if the
+     * flag has no payload. Does NOT emit `$feature_flag_called`.
+     */
+    open func getFeatureFlagPayloadJson(flagKey: String) throws -> String {
+        return try FfiConverterString.lift(rustCallWithError(FfiConverterTypeUniFFIError.lift) {
+            uniffi_layers_core_fn_method_layerscorehandle_get_feature_flag_payload_json(self.uniffiClonePointer(),
+                                                                                        FfiConverterString.lower(flagKey), $0)
+        })
+    }
+
+    /**
+     * Read the SDK's first-open timestamp (ISO 8601 string), or None.
+     */
+    open func getFirstOpenTime() -> String? {
+        return try! FfiConverterOptionString.lift(try! rustCall {
+            uniffi_layers_core_fn_method_layerscorehandle_get_first_open_time(self.uniffiClonePointer(), $0)
+        })
+    }
+
+    /**
+     * Snapshot the current `$groups` membership as a JSON object string.
+     */
+    open func getGroupsJson() throws -> String {
+        return try FfiConverterString.lift(rustCallWithError(FfiConverterTypeUniFFIError.lift) {
+            uniffi_layers_core_fn_method_layerscorehandle_get_groups_json(self.uniffiClonePointer(), $0)
         })
     }
 
@@ -873,6 +1350,24 @@ open class LayersCoreHandle:
     open func getSessionId() throws -> String {
         return try FfiConverterString.lift(rustCallWithError(FfiConverterTypeUniFFIError.lift) {
             uniffi_layers_core_fn_method_layerscorehandle_get_session_id(self.uniffiClonePointer(), $0)
+        })
+    }
+
+    /**
+     * Read the current monotonic `session_number`.
+     */
+    open func getSessionNumber() -> UInt32 {
+        return try! FfiConverterUInt32.lift(try! rustCall {
+            uniffi_layers_core_fn_method_layerscorehandle_get_session_number(self.uniffiClonePointer(), $0)
+        })
+    }
+
+    /**
+     * Snapshot the registered super-properties as a JSON object string.
+     */
+    open func getSuperPropertiesJson() -> String {
+        return try! FfiConverterString.lift(try! rustCall {
+            uniffi_layers_core_fn_method_layerscorehandle_get_super_properties_json(self.uniffiClonePointer(), $0)
         })
     }
 
@@ -898,6 +1393,46 @@ open class LayersCoreHandle:
     }
 
     /**
+     * Increment a numeric user property by `delta` (server-side `$add`).
+     */
+    open func increment(key: String, delta: Double) throws { try rustCallWithError(FfiConverterTypeUniFFIError.lift) {
+        uniffi_layers_core_fn_method_layerscorehandle_increment(self.uniffiClonePointer(),
+                                                                FfiConverterString.lower(key),
+                                                                FfiConverterDouble.lower(delta), $0)
+    }
+    }
+
+    /**
+     * Whether the SDK was configured with cookieless mode (web only).
+     */
+    open func isCookielessMode() -> Bool {
+        return try! FfiConverterBool.lift(try! rustCall {
+            uniffi_layers_core_fn_method_layerscorehandle_is_cookieless_mode(self.uniffiClonePointer(), $0)
+        })
+    }
+
+    /**
+     * Read the current DNT-active signal.
+     */
+    open func isDntActive() -> Bool {
+        return try! FfiConverterBool.lift(try! rustCall {
+            uniffi_layers_core_fn_method_layerscorehandle_is_dnt_active(self.uniffiClonePointer(), $0)
+        })
+    }
+
+    /**
+     * Returns true iff the flag is truthy. Convenience wrapper around
+     * `get_feature_flag_json`. Treats variant strings as truthy except `""`
+     * and `"false"`. Falls back to `false` for unknown flags.
+     */
+    open func isFeatureEnabled(flagKey: String) throws -> Bool {
+        return try FfiConverterBool.lift(rustCallWithError(FfiConverterTypeUniFFIError.lift) {
+            uniffi_layers_core_fn_method_layerscorehandle_is_feature_enabled(self.uniffiClonePointer(),
+                                                                             FfiConverterString.lower(flagKey), $0)
+        })
+    }
+
+    /**
      * Check whether the SDK is still initialized (not shut down).
      */
     open func isInitialized() -> Bool {
@@ -916,11 +1451,58 @@ open class LayersCoreHandle:
     }
 
     /**
+     * Snapshot the list of currently-known flag keys.
+     */
+    open func knownFeatureFlagKeys() -> [String] {
+        return try! FfiConverterSequenceString.lift(try! rustCall {
+            uniffi_layers_core_fn_method_layerscorehandle_known_feature_flag_keys(self.uniffiClonePointer(), $0)
+        })
+    }
+
+    /**
+     * Snapshot of all known survey ids (after `update_remote_config` has
+     * pulled definitions out of the config response).
+     */
+    open func knownSurveyIds() -> [String] {
+        return try! FfiConverterSequenceString.lift(try! rustCall {
+            uniffi_layers_core_fn_method_layerscorehandle_known_survey_ids(self.uniffiClonePointer(), $0)
+        })
+    }
+
+    /**
      * Mark config as not modified (304 response) — resets the TTL timer
      * without replacing the cached config.
      */
     open func markConfigNotModified() throws { try rustCallWithError(FfiConverterTypeUniFFIError.lift) {
         uniffi_layers_core_fn_method_layerscorehandle_mark_config_not_modified(self.uniffiClonePointer(), $0)
+    }
+    }
+
+    /**
+     * Mark a survey as dismissed — emits `survey dismissed` auto-event.
+     */
+    open func markSurveyDismissed(surveyId: String) throws { try rustCallWithError(FfiConverterTypeUniFFIError.lift) {
+        uniffi_layers_core_fn_method_layerscorehandle_mark_survey_dismissed(self.uniffiClonePointer(),
+                                                                            FfiConverterString.lower(surveyId), $0)
+    }
+    }
+
+    /**
+     * Mark a survey as shown — emits `survey shown` auto-event and bumps
+     * the frequency-cap counter.
+     */
+    open func markSurveyShown(surveyId: String) throws { try rustCallWithError(FfiConverterTypeUniFFIError.lift) {
+        uniffi_layers_core_fn_method_layerscorehandle_mark_survey_shown(self.uniffiClonePointer(),
+                                                                        FfiConverterString.lower(surveyId), $0)
+    }
+    }
+
+    /**
+     * Merge additional properties into the flag-evaluation override map.
+     */
+    open func mergePersonPropertiesForFlags(propertiesJson: String) throws { try rustCallWithError(FfiConverterTypeUniFFIError.lift) {
+        uniffi_layers_core_fn_method_layerscorehandle_merge_person_properties_for_flags(self.uniffiClonePointer(),
+                                                                                        FfiConverterString.lower(propertiesJson), $0)
     }
     }
 
@@ -934,6 +1516,25 @@ open class LayersCoreHandle:
     }
 
     /**
+     * Clear cached flag definitions; the next `/config` fetch will repopulate.
+     * Returns `true` if any definitions were dropped.
+     */
+    open func reloadFeatureFlags() throws -> Bool {
+        return try FfiConverterBool.lift(rustCallWithError(FfiConverterTypeUniFFIError.lift) {
+            uniffi_layers_core_fn_method_layerscorehandle_reload_feature_flags(self.uniffiClonePointer(), $0)
+        })
+    }
+
+    /**
+     * Remove a single group_type from the membership map.
+     */
+    open func removeGroup(groupType: String) throws { try rustCallWithError(FfiConverterTypeUniFFIError.lift) {
+        uniffi_layers_core_fn_method_layerscorehandle_remove_group(self.uniffiClonePointer(),
+                                                                   FfiConverterString.lower(groupType), $0)
+    }
+    }
+
+    /**
      * Re-enqueue events at the front of the queue after a failed HTTP
      * delivery. Expects the same JSON array of events from drain_batch.
      */
@@ -941,6 +1542,33 @@ open class LayersCoreHandle:
         return try FfiConverterUInt32.lift(rustCallWithError(FfiConverterTypeUniFFIError.lift) {
             uniffi_layers_core_fn_method_layerscorehandle_requeue_events(self.uniffiClonePointer(),
                                                                          FfiConverterString.lower(eventsJson), $0)
+        })
+    }
+
+    /**
+     * Whether the SDK was configured to require explicit consent.
+     */
+    open func requiresExplicitConsent() -> Bool {
+        return try! FfiConverterBool.lift(try! rustCall {
+            uniffi_layers_core_fn_method_layerscorehandle_requires_explicit_consent(self.uniffiClonePointer(), $0)
+        })
+    }
+
+    /**
+     * Clear identity: drops user_id, rotates device_id and anonymous_id,
+     * clears super-properties and groups, drops in-flight events.
+     */
+    open func reset() throws { try rustCallWithError(FfiConverterTypeUniFFIError.lift) {
+        uniffi_layers_core_fn_method_layerscorehandle_reset(self.uniffiClonePointer(), $0)
+    }
+    }
+
+    /**
+     * Whether the SDK was configured to respect Do-Not-Track signals.
+     */
+    open func respectsDnt() -> Bool {
+        return try! FfiConverterBool.lift(try! rustCall {
+            uniffi_layers_core_fn_method_layerscorehandle_respects_dnt(self.uniffiClonePointer(), $0)
         })
     }
 
@@ -966,11 +1594,44 @@ open class LayersCoreHandle:
     }
 
     /**
-     * Update consent state.
+     * Restore a previously snapshotted show-history map.
+     */
+    open func seedSurveyShowHistory(historyJson: String) throws { try rustCallWithError(FfiConverterTypeUniFFIError.lift) {
+        uniffi_layers_core_fn_method_layerscorehandle_seed_survey_show_history(self.uniffiClonePointer(),
+                                                                               FfiConverterString.lower(historyJson), $0)
+    }
+    }
+
+    /**
+     * Register a `before_send` filter callback. The callback receives the event as
+     * JSON and returns either the (possibly modified) event JSON, or `None` to drop.
+     */
+    open func setBeforeSend(callback: UniFfiBeforeSendCallback) { try! rustCall {
+        uniffi_layers_core_fn_method_layerscorehandle_set_before_send(self.uniffiClonePointer(),
+                                                                      FfiConverterCallbackInterfaceUniFfiBeforeSendCallback.lower(callback), $0)
+    }
+    }
+
+    /**
+     * Update consent state (Consent Mode v2).
+     *
+     * On Denied → Granted transition for `analytics_storage`, the SDK
+     * auto-drains queued events.
      */
     open func setConsent(consent: UniFfiConsent) throws { try rustCallWithError(FfiConverterTypeUniFFIError.lift) {
         uniffi_layers_core_fn_method_layerscorehandle_set_consent(self.uniffiClonePointer(),
                                                                   FfiConverterTypeUniFFIConsent.lower(consent), $0)
+    }
+    }
+
+    /**
+     * DEPRECATED: legacy two-flag consent API. Wrappers should prefer
+     * `set_consent` with an explicit `UniFFIConsent` record.
+     */
+    open func setConsentLegacy(analytics: Bool?, advertising: Bool?) throws { try rustCallWithError(FfiConverterTypeUniFFIError.lift) {
+        uniffi_layers_core_fn_method_layerscorehandle_set_consent_legacy(self.uniffiClonePointer(),
+                                                                         FfiConverterOptionBool.lower(analytics),
+                                                                         FfiConverterOptionBool.lower(advertising), $0)
     }
     }
 
@@ -980,6 +1641,67 @@ open class LayersCoreHandle:
     open func setDeviceContext(context: UniFfiDeviceContext) throws { try rustCallWithError(FfiConverterTypeUniFFIError.lift) {
         uniffi_layers_core_fn_method_layerscorehandle_set_device_context(self.uniffiClonePointer(),
                                                                          FfiConverterTypeUniFFIDeviceContext.lower(context), $0)
+    }
+    }
+
+    /**
+     * Web wrappers call this to inform the core whether the browser DNT
+     * signal is currently active. Native wrappers should not call this
+     * (the platform has no equivalent OS-level signal).
+     */
+    open func setDntSignal(dntActive: Bool) { try! rustCall {
+        uniffi_layers_core_fn_method_layerscorehandle_set_dnt_signal(self.uniffiClonePointer(),
+                                                                     FfiConverterBool.lower(dntActive), $0)
+    }
+    }
+
+    /**
+     * Seed bootstrap values + payloads (for SSR / pre-render). The
+     * `bootstrap_json` argument should match the `BootstrapData` shape:
+     * `{ "feature_flags": {...}, "feature_flag_payloads": {...} }`.
+     */
+    open func setFeatureFlagBootstrap(bootstrapJson: String) throws { try rustCallWithError(FfiConverterTypeUniFFIError.lift) {
+        uniffi_layers_core_fn_method_layerscorehandle_set_feature_flag_bootstrap(self.uniffiClonePointer(),
+                                                                                 FfiConverterString.lower(bootstrapJson), $0)
+    }
+    }
+
+    /**
+     * Set membership for a single group_type. Pass empty string for `group_id` to remove.
+     */
+    open func setGroup(groupType: String, groupId: String) throws { try rustCallWithError(FfiConverterTypeUniFFIError.lift) {
+        uniffi_layers_core_fn_method_layerscorehandle_set_group(self.uniffiClonePointer(),
+                                                                FfiConverterString.lower(groupType),
+                                                                FfiConverterString.lower(groupId), $0)
+    }
+    }
+
+    /**
+     * Override person properties used for flag evaluation only.
+     * `properties_json` must be a JSON object string.
+     */
+    open func setPersonPropertiesForFlags(propertiesJson: String) throws { try rustCallWithError(FfiConverterTypeUniFFIError.lift) {
+        uniffi_layers_core_fn_method_layerscorehandle_set_person_properties_for_flags(self.uniffiClonePointer(),
+                                                                                      FfiConverterString.lower(propertiesJson), $0)
+    }
+    }
+
+    /**
+     * Register one or more super-properties (auto-merged into every track/screen).
+     * `properties_json` must be a JSON object string.
+     */
+    open func setSuperProperties(propertiesJson: String) throws { try rustCallWithError(FfiConverterTypeUniFFIError.lift) {
+        uniffi_layers_core_fn_method_layerscorehandle_set_super_properties(self.uniffiClonePointer(),
+                                                                           FfiConverterString.lower(propertiesJson), $0)
+    }
+    }
+
+    /**
+     * Register super-properties only if they have not been registered before.
+     */
+    open func setSuperPropertiesOnce(propertiesJson: String) throws { try rustCallWithError(FfiConverterTypeUniFFIError.lift) {
+        uniffi_layers_core_fn_method_layerscorehandle_set_super_properties_once(self.uniffiClonePointer(),
+                                                                                FfiConverterString.lower(propertiesJson), $0)
     }
     }
 
@@ -1012,6 +1734,50 @@ open class LayersCoreHandle:
     }
 
     /**
+     * Submit a survey response — emits `survey sent` auto-event with the
+     * answers attached. `response_json` is a `SurveyResponse` JSON object.
+     */
+    open func submitSurveyResponse(surveyId: String, responseJson: String) throws { try rustCallWithError(FfiConverterTypeUniFFIError.lift) {
+        uniffi_layers_core_fn_method_layerscorehandle_submit_survey_response(self.uniffiClonePointer(),
+                                                                             FfiConverterString.lower(surveyId),
+                                                                             FfiConverterString.lower(responseJson), $0)
+    }
+    }
+
+    /**
+     * Snapshot of all currently-cached survey definitions as a JSON array.
+     * Used by wrappers to discover targeting dependencies (e.g. feature
+     * flag references) without iterating active surveys, which would
+     * create a circular dependency with flag-gated surveys (a flag-gated
+     * survey can never be "active" until its flag has been resolved, but
+     * the wrapper only knows which flags to resolve by reading definitions).
+     */
+    open func surveyDefinitionsJson() throws -> String {
+        return try FfiConverterString.lift(rustCallWithError(FfiConverterTypeUniFFIError.lift) {
+            uniffi_layers_core_fn_method_layerscorehandle_survey_definitions_json(self.uniffiClonePointer(), $0)
+        })
+    }
+
+    /**
+     * Snapshot of per-survey-id show timestamps for cross-restart persistence.
+     */
+    open func surveyShowHistoryJson() throws -> String {
+        return try FfiConverterString.lift(rustCallWithError(FfiConverterTypeUniFFIError.lift) {
+            uniffi_layers_core_fn_method_layerscorehandle_survey_show_history_json(self.uniffiClonePointer(), $0)
+        })
+    }
+
+    /**
+     * Start a duration timer for the next `track(name, ...)` call. The
+     * resulting event will carry `$duration_ms`.
+     */
+    open func timeEvent(eventName: String) throws { try rustCallWithError(FfiConverterTypeUniFFIError.lift) {
+        uniffi_layers_core_fn_method_layerscorehandle_time_event(self.uniffiClonePointer(),
+                                                                 FfiConverterString.lower(eventName), $0)
+    }
+    }
+
+    /**
      * Track a custom event.
      *
      * `properties_json` is a JSON string that will be parsed as a JSON object.
@@ -1023,6 +1789,35 @@ open class LayersCoreHandle:
                                                             FfiConverterOptionString.lower(propertiesJson),
                                                             FfiConverterOptionString.lower(userId),
                                                             FfiConverterOptionString.lower(anonymousId), $0)
+    }
+    }
+
+    /**
+     * Union an array of values into a list-valued user property (server-side `$union`).
+     * `values_json` must be a JSON-encoded array.
+     */
+    open func union(key: String, valuesJson: String) throws { try rustCallWithError(FfiConverterTypeUniFFIError.lift) {
+        uniffi_layers_core_fn_method_layerscorehandle_union(self.uniffiClonePointer(),
+                                                            FfiConverterString.lower(key),
+                                                            FfiConverterString.lower(valuesJson), $0)
+    }
+    }
+
+    /**
+     * Remove a single super-property by key. The key remains "once-locked".
+     */
+    open func unregisterSuperProperty(key: String) throws { try rustCallWithError(FfiConverterTypeUniFFIError.lift) {
+        uniffi_layers_core_fn_method_layerscorehandle_unregister_super_property(self.uniffiClonePointer(),
+                                                                                FfiConverterString.lower(key), $0)
+    }
+    }
+
+    /**
+     * Remove a user property (server-side `$unset`).
+     */
+    open func unset(key: String) throws { try rustCallWithError(FfiConverterTypeUniFFIError.lift) {
+        uniffi_layers_core_fn_method_layerscorehandle_unset(self.uniffiClonePointer(),
+                                                            FfiConverterString.lower(key), $0)
     }
     }
 
@@ -1118,18 +1913,56 @@ public struct UniFfiConfig {
     public let maxQueueSize: UInt32?
     public let maxBatchSize: UInt32?
     public let enableDebug: Bool?
+    /**
+     * Enable per-device DebugView. When true, the SDK mints + persists a
+     * stable UUID and sends it in the `X-Debug-Token` header on every
+     * request. Retrieve via [`LayersCoreHandle::debug_token`].
+     */
+    public let debug: Bool?
     public let sdkVersion: String?
     /**
      * Directory for file-based event persistence.
      */
     public let persistenceDir: String?
+    /**
+     * Web wrappers respect the browser DNT signal when true. Native
+     * platforms have no equivalent and ignore this flag.
+     */
+    public let respectDnt: Bool?
+    /**
+     * Web cookieless identification mode. Adds `X-Cookieless: true` to
+     * every flush. Native platforms ignore this flag.
+     */
+    public let cookielessMode: Bool?
+    /**
+     * Opt-in-by-default mode. Queue events but do not flush until the
+     * host app makes its first explicit `set_consent` call.
+     */
+    public let consentRequired: Bool?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(appId: String, environment: LayersEnvironment, baseUrl: String?, flushIntervalMs: UInt64?, flushThreshold: UInt32?, maxQueueSize: UInt32?, maxBatchSize: UInt32?, enableDebug: Bool?, sdkVersion: String?,
+    public init(appId: String, environment: LayersEnvironment, baseUrl: String?, flushIntervalMs: UInt64?, flushThreshold: UInt32?, maxQueueSize: UInt32?, maxBatchSize: UInt32?, enableDebug: Bool?,
+                /**
+                    * Enable per-device DebugView. When true, the SDK mints + persists a
+                    * stable UUID and sends it in the `X-Debug-Token` header on every
+                    * request. Retrieve via [`LayersCoreHandle::debug_token`].
+                    */ debug: Bool?, sdkVersion: String?,
                 /**
                     * Directory for file-based event persistence.
-                    */ persistenceDir: String?)
+                    */ persistenceDir: String?,
+                /**
+                    * Web wrappers respect the browser DNT signal when true. Native
+                    * platforms have no equivalent and ignore this flag.
+                    */ respectDnt: Bool?,
+                /**
+                    * Web cookieless identification mode. Adds `X-Cookieless: true` to
+                    * every flush. Native platforms ignore this flag.
+                    */ cookielessMode: Bool?,
+                /**
+                    * Opt-in-by-default mode. Queue events but do not flush until the
+                    * host app makes its first explicit `set_consent` call.
+                    */ consentRequired: Bool?)
     {
         self.appId = appId
         self.environment = environment
@@ -1139,8 +1972,12 @@ public struct UniFfiConfig {
         self.maxQueueSize = maxQueueSize
         self.maxBatchSize = maxBatchSize
         self.enableDebug = enableDebug
+        self.debug = debug
         self.sdkVersion = sdkVersion
         self.persistenceDir = persistenceDir
+        self.respectDnt = respectDnt
+        self.cookielessMode = cookielessMode
+        self.consentRequired = consentRequired
     }
 }
 
@@ -1170,10 +2007,22 @@ extension UniFfiConfig: Equatable, Hashable {
         if lhs.enableDebug != rhs.enableDebug {
             return false
         }
+        if lhs.debug != rhs.debug {
+            return false
+        }
         if lhs.sdkVersion != rhs.sdkVersion {
             return false
         }
         if lhs.persistenceDir != rhs.persistenceDir {
+            return false
+        }
+        if lhs.respectDnt != rhs.respectDnt {
+            return false
+        }
+        if lhs.cookielessMode != rhs.cookielessMode {
+            return false
+        }
+        if lhs.consentRequired != rhs.consentRequired {
             return false
         }
         return true
@@ -1188,8 +2037,12 @@ extension UniFfiConfig: Equatable, Hashable {
         hasher.combine(maxQueueSize)
         hasher.combine(maxBatchSize)
         hasher.combine(enableDebug)
+        hasher.combine(debug)
         hasher.combine(sdkVersion)
         hasher.combine(persistenceDir)
+        hasher.combine(respectDnt)
+        hasher.combine(cookielessMode)
+        hasher.combine(consentRequired)
     }
 }
 
@@ -1208,8 +2061,12 @@ public struct FfiConverterTypeUniFFIConfig: FfiConverterRustBuffer {
                 maxQueueSize: FfiConverterOptionUInt32.read(from: &buf),
                 maxBatchSize: FfiConverterOptionUInt32.read(from: &buf),
                 enableDebug: FfiConverterOptionBool.read(from: &buf),
+                debug: FfiConverterOptionBool.read(from: &buf),
                 sdkVersion: FfiConverterOptionString.read(from: &buf),
-                persistenceDir: FfiConverterOptionString.read(from: &buf)
+                persistenceDir: FfiConverterOptionString.read(from: &buf),
+                respectDnt: FfiConverterOptionBool.read(from: &buf),
+                cookielessMode: FfiConverterOptionBool.read(from: &buf),
+                consentRequired: FfiConverterOptionBool.read(from: &buf)
             )
     }
 
@@ -1222,8 +2079,12 @@ public struct FfiConverterTypeUniFFIConfig: FfiConverterRustBuffer {
         FfiConverterOptionUInt32.write(value.maxQueueSize, into: &buf)
         FfiConverterOptionUInt32.write(value.maxBatchSize, into: &buf)
         FfiConverterOptionBool.write(value.enableDebug, into: &buf)
+        FfiConverterOptionBool.write(value.debug, into: &buf)
         FfiConverterOptionString.write(value.sdkVersion, into: &buf)
         FfiConverterOptionString.write(value.persistenceDir, into: &buf)
+        FfiConverterOptionBool.write(value.respectDnt, into: &buf)
+        FfiConverterOptionBool.write(value.cookielessMode, into: &buf)
+        FfiConverterOptionBool.write(value.consentRequired, into: &buf)
     }
 }
 
@@ -1242,15 +2103,68 @@ public func FfiConverterTypeUniFFIConfig_lower(_ value: UniFfiConfig) -> RustBuf
 }
 
 /**
- * Consent state record for UniFFI.
+ * Consent state record for UniFFI — Firebase Consent Mode v2 (4 categories).
+ *
+ * All four fields default to `None` (treated as Denied for gating purposes).
+ * The deprecated `analytics` / `advertising` fields are retained for backwards
+ * compat with older wrapper versions; new code should use the v2 fields.
  */
 public struct UniFfiConsent {
+    /**
+     * Analytics tracking — gates analytics flush. CMv2 default: Denied.
+     */
+    public let analyticsStorage: Bool?
+    /**
+     * Ad-related identifiers (IDFA, click IDs). CMv2 default: Denied.
+     */
+    public let adStorage: Bool?
+    /**
+     * Forwarding user data to ad networks. CMv2 default: Denied.
+     */
+    public let adUserData: Bool?
+    /**
+     * Personalized advertising. CMv2 default: Denied.
+     */
+    public let adPersonalization: Bool?
+    /**
+     * DEPRECATED — alias for `analytics_storage`. Wrappers passing this
+     * field still work; the SDK maps it to `analytics_storage`.
+     */
     public let analytics: Bool?
+    /**
+     * DEPRECATED — alias for `ad_storage`. Wrappers passing this field
+     * still work; the SDK maps it to `ad_storage`.
+     */
     public let advertising: Bool?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(analytics: Bool?, advertising: Bool?) {
+    public init(
+        /**
+         * Analytics tracking — gates analytics flush. CMv2 default: Denied.
+         */ analyticsStorage: Bool?,
+        /**
+            * Ad-related identifiers (IDFA, click IDs). CMv2 default: Denied.
+            */ adStorage: Bool?,
+        /**
+            * Forwarding user data to ad networks. CMv2 default: Denied.
+            */ adUserData: Bool?,
+        /**
+            * Personalized advertising. CMv2 default: Denied.
+            */ adPersonalization: Bool?,
+        /**
+            * DEPRECATED — alias for `analytics_storage`. Wrappers passing this
+            * field still work; the SDK maps it to `analytics_storage`.
+            */ analytics: Bool?,
+        /**
+            * DEPRECATED — alias for `ad_storage`. Wrappers passing this field
+            * still work; the SDK maps it to `ad_storage`.
+            */ advertising: Bool?
+    ) {
+        self.analyticsStorage = analyticsStorage
+        self.adStorage = adStorage
+        self.adUserData = adUserData
+        self.adPersonalization = adPersonalization
         self.analytics = analytics
         self.advertising = advertising
     }
@@ -1258,6 +2172,18 @@ public struct UniFfiConsent {
 
 extension UniFfiConsent: Equatable, Hashable {
     public static func == (lhs: UniFfiConsent, rhs: UniFfiConsent) -> Bool {
+        if lhs.analyticsStorage != rhs.analyticsStorage {
+            return false
+        }
+        if lhs.adStorage != rhs.adStorage {
+            return false
+        }
+        if lhs.adUserData != rhs.adUserData {
+            return false
+        }
+        if lhs.adPersonalization != rhs.adPersonalization {
+            return false
+        }
         if lhs.analytics != rhs.analytics {
             return false
         }
@@ -1268,6 +2194,10 @@ extension UniFfiConsent: Equatable, Hashable {
     }
 
     public func hash(into hasher: inout Hasher) {
+        hasher.combine(analyticsStorage)
+        hasher.combine(adStorage)
+        hasher.combine(adUserData)
+        hasher.combine(adPersonalization)
         hasher.combine(analytics)
         hasher.combine(advertising)
     }
@@ -1280,12 +2210,20 @@ public struct FfiConverterTypeUniFFIConsent: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UniFfiConsent {
         return
             try UniFfiConsent(
+                analyticsStorage: FfiConverterOptionBool.read(from: &buf),
+                adStorage: FfiConverterOptionBool.read(from: &buf),
+                adUserData: FfiConverterOptionBool.read(from: &buf),
+                adPersonalization: FfiConverterOptionBool.read(from: &buf),
                 analytics: FfiConverterOptionBool.read(from: &buf),
                 advertising: FfiConverterOptionBool.read(from: &buf)
             )
     }
 
     public static func write(_ value: UniFfiConsent, into buf: inout [UInt8]) {
+        FfiConverterOptionBool.write(value.analyticsStorage, into: &buf)
+        FfiConverterOptionBool.write(value.adStorage, into: &buf)
+        FfiConverterOptionBool.write(value.adUserData, into: &buf)
+        FfiConverterOptionBool.write(value.adPersonalization, into: &buf)
         FfiConverterOptionBool.write(value.analytics, into: &buf)
         FfiConverterOptionBool.write(value.advertising, into: &buf)
     }
@@ -1779,6 +2717,118 @@ public func FfiConverterTypeUniFFIPlatform_lower(_ value: UniFfiPlatform) -> Rus
 
 extension UniFfiPlatform: Equatable, Hashable {}
 
+/**
+ * UniFFI-exposed callback interface for `before_send` filtering.
+ *
+ * Foreign callers (Swift/Kotlin) implement this trait and register an
+ * instance via `LayersCoreHandle::set_before_send`. The callback is
+ * invoked for every event before queuing.
+ *
+ * Return value semantics:
+ * - `Some(json_string)` — the (possibly modified) event JSON to enqueue
+ * - `None` — drop the event
+ */
+public protocol UniFfiBeforeSendCallback: AnyObject {
+    /**
+     * Process an event JSON. Return `Some(json)` to keep, `None` to drop.
+     */
+    func onEvent(eventJson: String) -> String?
+}
+
+// Magic number for the Rust proxy to call using the same mechanism as every other method,
+// to free the callback once it's dropped by Rust.
+private let IDX_CALLBACK_FREE: Int32 = 0
+// Callback return codes
+private let UNIFFI_CALLBACK_SUCCESS: Int32 = 0
+private let UNIFFI_CALLBACK_ERROR: Int32 = 1
+private let UNIFFI_CALLBACK_UNEXPECTED_ERROR: Int32 = 2
+
+// Put the implementation in a struct so we don't pollute the top-level namespace
+private enum UniffiCallbackInterfaceUniFFIBeforeSendCallback {
+    // Create the VTable using a series of closures.
+    // Swift automatically converts these into C callback functions.
+    static var vtable: UniffiVTableCallbackInterfaceUniFfiBeforeSendCallback = .init(
+        onEvent: { (
+            uniffiHandle: UInt64,
+            eventJson: RustBuffer,
+            uniffiOutReturn: UnsafeMutablePointer<RustBuffer>,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> String? in
+                guard let uniffiObj = try? FfiConverterCallbackInterfaceUniFfiBeforeSendCallback.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return try uniffiObj.onEvent(
+                    eventJson: FfiConverterString.lift(eventJson)
+                )
+            }
+
+            let writeReturn = { uniffiOutReturn.pointee = FfiConverterOptionString.lower($0) }
+            uniffiTraitInterfaceCall(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn
+            )
+        },
+        uniffiFree: { (uniffiHandle: UInt64) in
+            let result = try? FfiConverterCallbackInterfaceUniFfiBeforeSendCallback.handleMap.remove(handle: uniffiHandle)
+            if result == nil {
+                print("Uniffi callback interface UniFFIBeforeSendCallback: handle missing in uniffiFree")
+            }
+        }
+    )
+}
+
+private func uniffiCallbackInitUniFFIBeforeSendCallback() {
+    uniffi_layers_core_fn_init_callback_vtable_uniffibeforesendcallback(&UniffiCallbackInterfaceUniFFIBeforeSendCallback.vtable)
+}
+
+// FfiConverter protocol for callback interfaces
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+private enum FfiConverterCallbackInterfaceUniFfiBeforeSendCallback {
+    fileprivate static var handleMap = UniffiHandleMap<UniFfiBeforeSendCallback>()
+}
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+extension FfiConverterCallbackInterfaceUniFfiBeforeSendCallback: FfiConverter {
+    typealias SwiftType = UniFfiBeforeSendCallback
+    typealias FfiType = UInt64
+
+    #if swift(>=5.8)
+        @_documentation(visibility: private)
+    #endif
+    public static func lift(_ handle: UInt64) throws -> SwiftType {
+        try handleMap.get(handle: handle)
+    }
+
+    #if swift(>=5.8)
+        @_documentation(visibility: private)
+    #endif
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+    #if swift(>=5.8)
+        @_documentation(visibility: private)
+    #endif
+    public static func lower(_ v: SwiftType) -> UInt64 {
+        return handleMap.insert(obj: v)
+    }
+
+    #if swift(>=5.8)
+        @_documentation(visibility: private)
+    #endif
+    public static func write(_ v: SwiftType, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(v))
+    }
+}
+
 #if swift(>=5.8)
     @_documentation(visibility: private)
 #endif
@@ -1899,6 +2949,31 @@ private struct FfiConverterOptionTypeUniFFIPlatform: FfiConverterRustBuffer {
     }
 }
 
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+private struct FfiConverterSequenceString: FfiConverterRustBuffer {
+    typealias SwiftType = [String]
+
+    static func write(_ value: [String], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterString.write(item, into: &buf)
+        }
+    }
+
+    static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [String] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [String]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            try seq.append(FfiConverterString.read(from: &buf))
+        }
+        return seq
+    }
+}
+
 private enum InitializationResult {
     case ok
     case contractVersionMismatch
@@ -1915,7 +2990,22 @@ private var initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
+    if uniffi_layers_core_checksum_method_layerscorehandle_add_group() != 57581 {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if uniffi_layers_core_checksum_method_layerscorehandle_append() != 23247 {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if uniffi_layers_core_checksum_method_layerscorehandle_cancel_timed_event() != 5688 {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if uniffi_layers_core_checksum_method_layerscorehandle_clear_before_send() != 64669 {
+        return InitializationResult.apiChecksumMismatch
+    }
     if uniffi_layers_core_checksum_method_layerscorehandle_clear_retry_after() != 8622 {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if uniffi_layers_core_checksum_method_layerscorehandle_clear_super_properties() != 36661 {
         return InitializationResult.apiChecksumMismatch
     }
     if uniffi_layers_core_checksum_method_layerscorehandle_config_etag() != 32954 {
@@ -1925,6 +3015,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if uniffi_layers_core_checksum_method_layerscorehandle_config_url() != 19268 {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if uniffi_layers_core_checksum_method_layerscorehandle_debug_token() != 57896 {
         return InitializationResult.apiChecksumMismatch
     }
     if uniffi_layers_core_checksum_method_layerscorehandle_drain_batch() != 55938 {
@@ -1939,10 +3032,37 @@ private var initializationResult: InitializationResult = {
     if uniffi_layers_core_checksum_method_layerscorehandle_flush() != 23417 {
         return InitializationResult.apiChecksumMismatch
     }
+    if uniffi_layers_core_checksum_method_layerscorehandle_flush_allowed() != 33722 {
+        return InitializationResult.apiChecksumMismatch
+    }
     if uniffi_layers_core_checksum_method_layerscorehandle_flush_headers_json() != 38513 {
         return InitializationResult.apiChecksumMismatch
     }
+    if uniffi_layers_core_checksum_method_layerscorehandle_get_active_surveys_json() != 38381 {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if uniffi_layers_core_checksum_method_layerscorehandle_get_all_flags_json() != 44562 {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if uniffi_layers_core_checksum_method_layerscorehandle_get_anonymous_id() != 60020 {
+        return InitializationResult.apiChecksumMismatch
+    }
     if uniffi_layers_core_checksum_method_layerscorehandle_get_consent_state() != 9433 {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if uniffi_layers_core_checksum_method_layerscorehandle_get_device_id() != 11692 {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if uniffi_layers_core_checksum_method_layerscorehandle_get_feature_flag_json() != 43166 {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if uniffi_layers_core_checksum_method_layerscorehandle_get_feature_flag_payload_json() != 779 {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if uniffi_layers_core_checksum_method_layerscorehandle_get_first_open_time() != 31134 {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if uniffi_layers_core_checksum_method_layerscorehandle_get_groups_json() != 9939 {
         return InitializationResult.apiChecksumMismatch
     }
     if uniffi_layers_core_checksum_method_layerscorehandle_get_remote_config_json() != 7987 {
@@ -1951,10 +3071,28 @@ private var initializationResult: InitializationResult = {
     if uniffi_layers_core_checksum_method_layerscorehandle_get_session_id() != 55035 {
         return InitializationResult.apiChecksumMismatch
     }
+    if uniffi_layers_core_checksum_method_layerscorehandle_get_session_number() != 22135 {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if uniffi_layers_core_checksum_method_layerscorehandle_get_super_properties_json() != 55779 {
+        return InitializationResult.apiChecksumMismatch
+    }
     if uniffi_layers_core_checksum_method_layerscorehandle_group() != 32224 {
         return InitializationResult.apiChecksumMismatch
     }
     if uniffi_layers_core_checksum_method_layerscorehandle_identify() != 37268 {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if uniffi_layers_core_checksum_method_layerscorehandle_increment() != 2270 {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if uniffi_layers_core_checksum_method_layerscorehandle_is_cookieless_mode() != 35076 {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if uniffi_layers_core_checksum_method_layerscorehandle_is_dnt_active() != 17181 {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if uniffi_layers_core_checksum_method_layerscorehandle_is_feature_enabled() != 24092 {
         return InitializationResult.apiChecksumMismatch
     }
     if uniffi_layers_core_checksum_method_layerscorehandle_is_initialized() != 18204 {
@@ -1963,13 +3101,43 @@ private var initializationResult: InitializationResult = {
     if uniffi_layers_core_checksum_method_layerscorehandle_is_retry_after_active() != 34554 {
         return InitializationResult.apiChecksumMismatch
     }
+    if uniffi_layers_core_checksum_method_layerscorehandle_known_feature_flag_keys() != 13616 {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if uniffi_layers_core_checksum_method_layerscorehandle_known_survey_ids() != 52708 {
+        return InitializationResult.apiChecksumMismatch
+    }
     if uniffi_layers_core_checksum_method_layerscorehandle_mark_config_not_modified() != 63447 {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if uniffi_layers_core_checksum_method_layerscorehandle_mark_survey_dismissed() != 35914 {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if uniffi_layers_core_checksum_method_layerscorehandle_mark_survey_shown() != 55988 {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if uniffi_layers_core_checksum_method_layerscorehandle_merge_person_properties_for_flags() != 14012 {
         return InitializationResult.apiChecksumMismatch
     }
     if uniffi_layers_core_checksum_method_layerscorehandle_queue_depth() != 24089 {
         return InitializationResult.apiChecksumMismatch
     }
+    if uniffi_layers_core_checksum_method_layerscorehandle_reload_feature_flags() != 54150 {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if uniffi_layers_core_checksum_method_layerscorehandle_remove_group() != 43915 {
+        return InitializationResult.apiChecksumMismatch
+    }
     if uniffi_layers_core_checksum_method_layerscorehandle_requeue_events() != 51517 {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if uniffi_layers_core_checksum_method_layerscorehandle_requires_explicit_consent() != 24253 {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if uniffi_layers_core_checksum_method_layerscorehandle_reset() != 58871 {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if uniffi_layers_core_checksum_method_layerscorehandle_respects_dnt() != 30971 {
         return InitializationResult.apiChecksumMismatch
     }
     if uniffi_layers_core_checksum_method_layerscorehandle_retry_after_remaining_ms() != 29171 {
@@ -1978,10 +3146,37 @@ private var initializationResult: InitializationResult = {
     if uniffi_layers_core_checksum_method_layerscorehandle_screen() != 7823 {
         return InitializationResult.apiChecksumMismatch
     }
-    if uniffi_layers_core_checksum_method_layerscorehandle_set_consent() != 13127 {
+    if uniffi_layers_core_checksum_method_layerscorehandle_seed_survey_show_history() != 32630 {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if uniffi_layers_core_checksum_method_layerscorehandle_set_before_send() != 13144 {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if uniffi_layers_core_checksum_method_layerscorehandle_set_consent() != 27007 {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if uniffi_layers_core_checksum_method_layerscorehandle_set_consent_legacy() != 35195 {
         return InitializationResult.apiChecksumMismatch
     }
     if uniffi_layers_core_checksum_method_layerscorehandle_set_device_context() != 5842 {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if uniffi_layers_core_checksum_method_layerscorehandle_set_dnt_signal() != 9175 {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if uniffi_layers_core_checksum_method_layerscorehandle_set_feature_flag_bootstrap() != 54223 {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if uniffi_layers_core_checksum_method_layerscorehandle_set_group() != 36606 {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if uniffi_layers_core_checksum_method_layerscorehandle_set_person_properties_for_flags() != 32847 {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if uniffi_layers_core_checksum_method_layerscorehandle_set_super_properties() != 9287 {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if uniffi_layers_core_checksum_method_layerscorehandle_set_super_properties_once() != 63634 {
         return InitializationResult.apiChecksumMismatch
     }
     if uniffi_layers_core_checksum_method_layerscorehandle_set_user_properties() != 23268 {
@@ -1993,7 +3188,28 @@ private var initializationResult: InitializationResult = {
     if uniffi_layers_core_checksum_method_layerscorehandle_shutdown() != 44265 {
         return InitializationResult.apiChecksumMismatch
     }
+    if uniffi_layers_core_checksum_method_layerscorehandle_submit_survey_response() != 15904 {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if uniffi_layers_core_checksum_method_layerscorehandle_survey_definitions_json() != 21757 {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if uniffi_layers_core_checksum_method_layerscorehandle_survey_show_history_json() != 60606 {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if uniffi_layers_core_checksum_method_layerscorehandle_time_event() != 33883 {
+        return InitializationResult.apiChecksumMismatch
+    }
     if uniffi_layers_core_checksum_method_layerscorehandle_track() != 24128 {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if uniffi_layers_core_checksum_method_layerscorehandle_union() != 37590 {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if uniffi_layers_core_checksum_method_layerscorehandle_unregister_super_property() != 28743 {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if uniffi_layers_core_checksum_method_layerscorehandle_unset() != 48017 {
         return InitializationResult.apiChecksumMismatch
     }
     if uniffi_layers_core_checksum_method_layerscorehandle_update_remote_config() != 60771 {
@@ -2005,7 +3221,11 @@ private var initializationResult: InitializationResult = {
     if uniffi_layers_core_checksum_constructor_layerscorehandle_init() != 21460 {
         return InitializationResult.apiChecksumMismatch
     }
+    if uniffi_layers_core_checksum_method_uniffibeforesendcallback_on_event() != 60029 {
+        return InitializationResult.apiChecksumMismatch
+    }
 
+    uniffiCallbackInitUniFFIBeforeSendCallback()
     return InitializationResult.ok
 }()
 

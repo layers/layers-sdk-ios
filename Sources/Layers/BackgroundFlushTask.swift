@@ -20,23 +20,11 @@ import UIKit
 /// 1. Add `com.layers.sdk.background-flush` to your app's
 ///    `Info.plist` under `BGTaskSchedulerPermittedIdentifiers`.
 ///
-/// 2. Call `registerBackgroundFlush()` in
-///    `application(_:didFinishLaunchingWithOptions:)` **before** the app
-///    finishes launching:
+/// 2. Call ``Layers/initialize(config:)`` — the SDK registers the
+///    background task handler automatically. No additional calls needed.
 ///
-///    ```swift
-///    func application(
-///        _ application: UIApplication,
-///        didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
-///    ) -> Bool {
-///        BackgroundFlushTask.registerBackgroundFlush()
-///        // ... rest of setup
-///        return true
-///    }
-///    ```
-///
-/// 3. The SDK automatically schedules the next execution after each run.
-///    You can also manually schedule it by calling `scheduleBackgroundFlush()`.
+/// If the plist entry is absent, background flushes are silently disabled
+/// and the app continues to work with foreground-only event delivery.
 ///
 public enum BackgroundFlushTask {
 
@@ -50,15 +38,40 @@ public enum BackgroundFlushTask {
 
     private static let log = OSLog(subsystem: "com.layers.sdk", category: "BackgroundFlush")
 
+    /// Guards against double-registration (Apple throws if you register the same identifier twice).
+    private static let lock = NSLock()
+    private static var _registered = false
+
     /// Register the background flush task with the system.
     ///
-    /// **Must** be called during `application(_:didFinishLaunchingWithOptions:)`
-    /// before the app finishes launching. Calling after launch has no effect
-    /// (BGTaskScheduler silently ignores late registrations).
+    /// The SDK calls this automatically during ``Layers/initialize(config:)``,
+    /// so most apps do **not** need to call it directly. If you want the earliest
+    /// possible registration in a SwiftUI app, you may call this from your
+    /// `@main App.init()` — repeated calls are safe (no-ops).
+    ///
+    /// If `BGTaskSchedulerPermittedIdentifiers` in Info.plist does not contain
+    /// the task identifier, registration is silently skipped and background
+    /// flushes are disabled. The app will **never** crash due to a missing
+    /// plist entry.
+    ///
+    /// - Returns: `true` if registration succeeded (or was already registered).
     ///
     /// This method is safe to call on all platforms. On macOS, tvOS, watchOS,
-    /// or iOS < 13, it is a no-op.
-    public static func registerBackgroundFlush() {
+    /// or iOS < 13, it is a no-op that returns `false`.
+    @available(*, deprecated, message: "No longer needed — Layers.initialize() registers automatically. Remove this call.")
+    @discardableResult
+    public static func registerBackgroundFlush() -> Bool {
+        return _registerIfNeeded()
+    }
+
+    /// Internal entry point called by ``Layers/initialize(config:)``.
+    @discardableResult
+    internal static func _registerIfNeeded() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard !_registered else { return true }
+
         #if canImport(BackgroundTasks) && os(iOS)
         if #available(iOS 13.0, *) {
             let registered = BGTaskScheduler.shared.register(
@@ -68,14 +81,18 @@ public enum BackgroundFlushTask {
                 handleBackgroundTask(task)
             }
             if registered {
+                _registered = true
                 os_log("Registered background flush task: %{public}@",
                        log: log, type: .info, taskIdentifier)
+                return true
             } else {
-                os_log("Failed to register background flush task. Ensure '%{public}@' is in Info.plist BGTaskSchedulerPermittedIdentifiers.",
-                       log: log, type: .error, taskIdentifier)
+                os_log("Background flush skipped — '%{public}@' not in Info.plist BGTaskSchedulerPermittedIdentifiers. Add it to enable background event delivery.",
+                       log: log, type: .info, taskIdentifier)
+                return false
             }
         }
         #endif
+        return false
     }
 
     /// Schedule the next background flush execution.

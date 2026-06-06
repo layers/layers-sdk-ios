@@ -113,6 +113,16 @@ public final class CommerceModule: @unchecked Sendable {
     private var _core: LayersCoreHandle?
     private var _skan: SKANModule?
 
+    /// StoreKit 2 `Transaction.updates` listener. Started lazily via
+    /// `startAutomaticPurchaseTracking()`. The task is cancelled on `detach()`.
+    private var _autoPurchaseTask: Task<Void, Never>?
+
+    /// Set of transaction IDs already emitted, to dedupe across:
+    ///   1. The initial `Transaction.currentEntitlements` flush on startup.
+    ///   2. The continuous `Transaction.updates` stream.
+    /// StoreKit 2 may yield the same transaction through both channels.
+    private var _emittedTransactionIds: Set<String> = []
+
     private var lockedCore: LayersCoreHandle? {
         lock.lock()
         defer { lock.unlock() }
@@ -132,6 +142,16 @@ public final class CommerceModule: @unchecked Sendable {
         _core = core
         _skan = skan
         lock.unlock()
+    }
+
+    /// Stop any in-flight `Transaction.updates` listener. Idempotent.
+    func detach() {
+        lock.lock()
+        let task = _autoPurchaseTask
+        _autoPurchaseTask = nil
+        _emittedTransactionIds.removeAll()
+        lock.unlock()
+        task?.cancel()
     }
 
     // MARK: - Purchase Tracking
@@ -338,6 +358,135 @@ public final class CommerceModule: @unchecked Sendable {
             originalTransactionId: String(skTransaction.originalID)
         )
         return trackPurchase(transaction: transaction)
+    }
+
+    // MARK: - Automatic StoreKit 2 Purchase Capture
+
+    /// Start a background `Task` that listens to `StoreKit.Transaction.updates`
+    /// and emits `$in_app_purchase` events for every finalized transaction.
+    ///
+    /// **Opt-in.** Wired by `Layers.initialize` only when
+    /// `LayersConfig(automaticPurchaseTrackingEnabled: true)` is passed —
+    /// the default is `false` for privacy posture (see CLAUDE.md decision #4).
+    ///
+    /// Idempotent: calling repeatedly is a no-op while a task is active.
+    @available(iOS 15.0, macOS 13.0, tvOS 15.0, watchOS 8.0, *)
+    public func startAutomaticPurchaseTracking() {
+        lock.lock()
+        if _autoPurchaseTask != nil {
+            lock.unlock()
+            return
+        }
+        // Detached so we don't inherit the caller's actor context.
+        let task: Task<Void, Never> = Task.detached(priority: .utility) { [weak self] in
+            guard let self = self else { return }
+            await self.consumeStoreKitUpdates()
+        }
+        _autoPurchaseTask = task
+        lock.unlock()
+    }
+
+    /// Stop the auto-capture task started by `startAutomaticPurchaseTracking()`.
+    @available(iOS 15.0, macOS 13.0, tvOS 15.0, watchOS 8.0, *)
+    public func stopAutomaticPurchaseTracking() {
+        lock.lock()
+        let task = _autoPurchaseTask
+        _autoPurchaseTask = nil
+        lock.unlock()
+        task?.cancel()
+    }
+
+    /// Build the `$in_app_purchase` property dict from a verified StoreKit 2
+    /// transaction. Extracted so unit tests can validate the property mapping
+    /// without spinning up a real StoreKit session.
+    @available(iOS 15.0, macOS 13.0, tvOS 15.0, watchOS 8.0, *)
+    static func inAppPurchaseProperties(
+        from skTransaction: StoreKit.Transaction
+    ) -> [String: String] {
+        let currencyCode: String
+        if #available(iOS 16.0, macOS 13.0, tvOS 16.0, watchOS 9.0, *) {
+            currencyCode = skTransaction.currency?.identifier ?? "USD"
+        } else {
+            currencyCode = "USD"
+        }
+        let price = skTransaction.price ?? .zero
+
+        var props: [String: String] = [
+            "transaction_id": String(skTransaction.id),
+            "original_transaction_id": String(skTransaction.originalID),
+            "product_id": skTransaction.productID,
+            "price": NSDecimalNumber(decimal: price).stringValue,
+            "currency": currencyCode,
+            "quantity": String(skTransaction.purchasedQuantity),
+            "is_upgraded": String(skTransaction.isUpgraded),
+        ]
+        if let groupId = skTransaction.subscriptionGroupID {
+            props["subscription_group_id"] = groupId
+        }
+        if let offer = skTransaction.offerID {
+            props["offer_id"] = offer
+        }
+        return props
+    }
+
+    @available(iOS 15.0, macOS 13.0, tvOS 15.0, watchOS 8.0, *)
+    private func consumeStoreKitUpdates() async {
+        for await result in StoreKit.Transaction.updates {
+            if Task.isCancelled { return }
+            await processVerificationResult(result)
+        }
+    }
+
+    @available(iOS 15.0, macOS 13.0, tvOS 15.0, watchOS 8.0, *)
+    private func processVerificationResult(
+        _ result: VerificationResult<StoreKit.Transaction>
+    ) async {
+        guard case .verified(let tx) = result else {
+            // Unverified transactions are dropped — same posture as Apple's docs.
+            return
+        }
+        emitInAppPurchase(transaction: tx)
+        await tx.finish()
+    }
+
+    /// Emit `$in_app_purchase` for the given transaction, deduping by `id`.
+    /// Internal so unit tests can drive emission without a real StoreKit stream.
+    @available(iOS 15.0, macOS 13.0, tvOS 15.0, watchOS 8.0, *)
+    func emitInAppPurchase(transaction: StoreKit.Transaction) {
+        let txId = String(transaction.id)
+        lock.lock()
+        guard let core = _core else {
+            lock.unlock()
+            return
+        }
+        if _emittedTransactionIds.contains(txId) {
+            lock.unlock()
+            return
+        }
+        _emittedTransactionIds.insert(txId)
+        let skan = _skan
+        lock.unlock()
+
+        let props = Self.inAppPurchaseProperties(from: transaction)
+        do {
+            try core.track(
+                eventName: "$in_app_purchase",
+                propertiesJson: Layers.jsonString(from: props),
+                userId: nil,
+                anonymousId: nil
+            )
+            skan?.processEvent(eventName: "purchase", properties: props)
+        } catch {
+            // Best-effort — auto-capture must never crash the host app.
+        }
+    }
+
+    /// Test hook: returns the count of transaction IDs the dedupe set is
+    /// currently holding.
+    var _emittedTransactionCountForTesting: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return _emittedTransactionIds.count
     }
     #endif
 }

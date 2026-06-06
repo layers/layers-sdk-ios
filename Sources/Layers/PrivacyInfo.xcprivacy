@@ -2,10 +2,28 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+    <!--
+      Layers Swift SDK Privacy Manifest
+
+      Audited 2026-05-01 (Tier 9 privacy posture work).
+
+      The Rust core that backs this SDK touches a small number of Apple
+      "required reason" APIs. Each entry below documents what we use and
+      why. Apple validates this file against actual API usage at App
+      Store submission — keep it in sync with what the Rust core / Swift
+      wrapper actually does.
+    -->
+
     <key>NSPrivacyTracking</key>
     <false/>
     <key>NSPrivacyTrackingDomains</key>
     <array/>
+
+    <!--
+      Data types collected by the SDK. Both are device-scoped /
+      product-interaction telemetry — never linked to identity (the host
+      app may layer that on, but the SDK alone does not).
+    -->
     <key>NSPrivacyCollectedDataTypes</key>
     <array>
         <dict>
@@ -32,7 +50,57 @@
                 <string>NSPrivacyCollectedDataTypePurposeAnalytics</string>
             </array>
         </dict>
+        <dict>
+            <key>NSPrivacyCollectedDataType</key>
+            <string>NSPrivacyCollectedDataTypeCrashData</string>
+            <key>NSPrivacyCollectedDataTypeLinked</key>
+            <false/>
+            <key>NSPrivacyCollectedDataTypeTracking</key>
+            <false/>
+            <key>NSPrivacyCollectedDataTypePurposes</key>
+            <array>
+                <string>NSPrivacyCollectedDataTypePurposeAppFunctionality</string>
+            </array>
+        </dict>
+        <dict>
+            <key>NSPrivacyCollectedDataType</key>
+            <string>NSPrivacyCollectedDataTypePerformanceData</string>
+            <key>NSPrivacyCollectedDataTypeLinked</key>
+            <false/>
+            <key>NSPrivacyCollectedDataTypeTracking</key>
+            <false/>
+            <key>NSPrivacyCollectedDataTypePurposes</key>
+            <array>
+                <string>NSPrivacyCollectedDataTypePurposeAnalytics</string>
+            </array>
+        </dict>
     </array>
+
+    <!--
+      Required-reason APIs we touch.
+
+      Audited usages:
+      - UserDefaults: Swift wrapper persists `first_open` flag and small
+        config hints for the host app's lifecycle observer.
+        Reason CA92.1 — "Read or write to user defaults that are
+        accessible only to the app itself or to a group that the app is
+        a member of."
+      - File timestamp APIs: the Rust persistence layer (FilePersistence
+        in `core/src/persistence.rs`) writes timestamped queue files via
+        `chrono::Utc::now().timestamp_millis()` and reads file metadata
+        for hydration / TTL eviction. Atomic writes use `.tmp` + rename.
+        Reason C617.1 — "Inside app container, app group container, or
+        the app's CloudKit container."
+      - System boot time: the Rust core's `Instant` type uses the
+        platform clock to compute relative durations for `time_event()`,
+        circuit-breaker reset timers, retry backoff, etc. On Apple
+        platforms `std::time::Instant` reads the system boot time.
+        Reason 35F9.1 — "Measure the amount of time that has elapsed
+        between events that occur within the app."
+      - Disk space: not currently used by the Rust core or Swift
+        wrapper. Declaration intentionally omitted; if a future tier
+        adds disk-space-aware persistence, add it here.
+    -->
     <key>NSPrivacyAccessedAPITypes</key>
     <array>
         <dict>
@@ -41,6 +109,22 @@
             <key>NSPrivacyAccessedAPITypeReasons</key>
             <array>
                 <string>CA92.1</string>
+            </array>
+        </dict>
+        <dict>
+            <key>NSPrivacyAccessedAPIType</key>
+            <string>NSPrivacyAccessedAPICategoryFileTimestamp</string>
+            <key>NSPrivacyAccessedAPITypeReasons</key>
+            <array>
+                <string>C617.1</string>
+            </array>
+        </dict>
+        <dict>
+            <key>NSPrivacyAccessedAPIType</key>
+            <string>NSPrivacyAccessedAPICategorySystemBootTime</string>
+            <key>NSPrivacyAccessedAPITypeReasons</key>
+            <array>
+                <string>35F9.1</string>
             </array>
         </dict>
     </array>

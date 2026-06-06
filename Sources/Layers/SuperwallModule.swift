@@ -42,19 +42,19 @@ public final class SuperwallModule: @unchecked Sendable {
     // MARK: - Properties
 
     private let lock = NSLock()
-    private var _layers: Layers?
+    private var _sdk: Layers?
 
-    private var lockedLayers: Layers? {
+    private var lockedSdk: Layers? {
         lock.lock()
         defer { lock.unlock() }
-        return _layers
+        return _sdk
     }
 
     init() {}
 
-    func attach(layers: Layers) {
+    func attach(sdk: Layers) {
         lock.lock()
-        _layers = layers
+        _sdk = sdk
         lock.unlock()
     }
 
@@ -71,12 +71,12 @@ public final class SuperwallModule: @unchecked Sendable {
     ///   - params: Optional dictionary of event parameters from Superwall.
     @discardableResult
     public func onEvent(eventName: String, params: [String: Any]? = nil) -> SafeResult<Void> {
-        guard let layers = lockedLayers else { return .failure(.notInitialized) }
+        guard let sdk = lockedSdk else { return .failure(.notInitialized) }
         var properties: [String: Any] = ["source": "superwall"]
         if let params {
             properties.merge(params) { _, new in new }
         }
-        return layers.track("superwall_\(eventName)", properties: properties)
+        return sdk.track("superwall_\(eventName)", properties: properties)
     }
 
     // MARK: - Typed Paywall Events
@@ -95,7 +95,7 @@ public final class SuperwallModule: @unchecked Sendable {
         experimentId: String? = nil,
         variantId: String? = nil
     ) -> SafeResult<Void> {
-        guard let layers = lockedLayers else { return .failure(.notInitialized) }
+        guard let sdk = lockedSdk else { return .failure(.notInitialized) }
         var properties: [String: Any] = [
             "paywall_id": paywallId,
             "placement": placement ?? "unknown",
@@ -107,7 +107,7 @@ public final class SuperwallModule: @unchecked Sendable {
                 "variant": variantId
             ]
         }
-        return layers.track("paywall_show", properties: properties)
+        return sdk.track("paywall_show", properties: properties)
     }
 
     /// Track that a paywall was dismissed.
@@ -115,8 +115,8 @@ public final class SuperwallModule: @unchecked Sendable {
     /// - Parameter paywallId: The paywall identifier from `PaywallInfo.identifier`.
     @discardableResult
     public func trackDismiss(paywallId: String) -> SafeResult<Void> {
-        guard let layers = lockedLayers else { return .failure(.notInitialized) }
-        return layers.track("paywall_dismiss", properties: [
+        guard let sdk = lockedSdk else { return .failure(.notInitialized) }
+        return sdk.track("paywall_dismiss", properties: [
             "paywall_id": paywallId,
             "source": "superwall"
         ])
@@ -136,7 +136,7 @@ public final class SuperwallModule: @unchecked Sendable {
         price: Decimal? = nil,
         currency: String? = nil
     ) -> SafeResult<Void> {
-        guard let layers = lockedLayers else { return .failure(.notInitialized) }
+        guard let sdk = lockedSdk else { return .failure(.notInitialized) }
         var properties: [String: Any] = [
             "paywall_id": paywallId,
             "source": "superwall"
@@ -144,7 +144,7 @@ public final class SuperwallModule: @unchecked Sendable {
         if let productId { properties["product_id"] = productId }
         if let price { properties["price"] = NSDecimalNumber(decimal: price).doubleValue }
         if let currency { properties["currency"] = currency }
-        return layers.track("paywall_purchase", properties: properties)
+        return sdk.track("paywall_purchase", properties: properties)
     }
 
     /// Track that a paywall was skipped (e.g. user holdout, no rule match).
@@ -155,8 +155,8 @@ public final class SuperwallModule: @unchecked Sendable {
     ///     `"no_rule_match"`, `"user_is_subscribed"`).
     @discardableResult
     public func trackSkip(paywallId: String? = nil, reason: String) -> SafeResult<Void> {
-        guard let layers = lockedLayers else { return .failure(.notInitialized) }
-        return layers.track("paywall_skip", properties: [
+        guard let sdk = lockedSdk else { return .failure(.notInitialized) }
+        return sdk.track("paywall_skip", properties: [
             "paywall_id": paywallId ?? "unknown",
             "reason": reason,
             "source": "superwall"
@@ -176,18 +176,18 @@ public final class SuperwallModule: @unchecked Sendable {
     /// Superwall.instance.setUserAttributes(attrs)
     /// ```
     public func userAttributes() -> [String: Any] {
-        guard let layers = lockedLayers else { return [:] }
+        guard let sdk = lockedSdk else { return [:] }
         var attrs: [String: Any] = [:]
         let installId = Layers.getOrCreateInstallId()
         attrs["layers_id"] = installId
-        let anonId = layers.anonymousId
+        let anonId = sdk.anonymousId
         if !anonId.isEmpty {
             attrs["layers_anonymous_id"] = anonId
         }
-        if let userId = layers.appUserId {
+        if let userId = sdk.appUserId {
             attrs["layers_user_id"] = userId
         }
-        if let sessionId = layers.sessionId {
+        if let sessionId = sdk.sessionId {
             attrs["layers_session_id"] = sessionId
         }
         return attrs
