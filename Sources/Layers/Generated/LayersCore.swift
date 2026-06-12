@@ -533,6 +533,13 @@ private struct FfiConverterString: FfiConverter {
  */
 public protocol LayersCoreHandleProtocol: AnyObject {
     /**
+     * Abort a flush attempt that never reached the wire (queue raced
+     * empty, URL/header setup failed, cancelled). Releases a claimed
+     * half-open breaker probe without counting a delivery failure.
+     */
+    func abortFlushAttempt()
+
+    /**
      * Add a group membership (alias for `set_group`).
      */
     func addGroup(groupType: String, groupId: String) throws
@@ -802,6 +809,15 @@ public protocol LayersCoreHandleProtocol: AnyObject {
     func queueDepth() -> UInt32
 
     /**
+     * Report the outcome of a delivery attempt (status `0` = no response /
+     * network error) and get the verdict for the in-flight batch:
+     * `Delivered` (done), `RetryLater` (requeue; next tick retries), or
+     * `Drop` (discard; non-retryable rejection). Feeds the circuit breaker
+     * and Retry-After gate — wrappers must not track these themselves.
+     */
+    func recordFlushResult(status: UInt16, retryAfterHeader: String?) -> UniFfiFlushDisposition
+
+    /**
      * Clear cached flag definitions; the next `/config` fetch will repopulate.
      * Returns `true` if any definitions were dropped.
      */
@@ -921,6 +937,14 @@ public protocol LayersCoreHandleProtocol: AnyObject {
      * `properties_json` must be a JSON object string.
      */
     func setUserPropertiesOnce(propertiesJson: String) throws
+
+    /**
+     * Single delivery gate: privacy (consent/DNT), server-requested
+     * Retry-After delay, and the circuit breaker. Call before each flush
+     * tick, only when there are events to send, and always follow a true
+     * result with `record_flush_result`.
+     */
+    func shouldAttemptFlush() -> Bool
 
     /**
      * Gracefully shut down: persist remaining events, stop processing.
@@ -1061,6 +1085,16 @@ open class LayersCoreHandle:
                 FfiConverterTypeUniFFIConfig.lower(config), $0
             )
         })
+    }
+
+    /**
+     * Abort a flush attempt that never reached the wire (queue raced
+     * empty, URL/header setup failed, cancelled). Releases a claimed
+     * half-open breaker probe without counting a delivery failure.
+     */
+    open func abortFlushAttempt() { try! rustCall {
+        uniffi_layers_core_fn_method_layerscorehandle_abort_flush_attempt(self.uniffiClonePointer(), $0)
+    }
     }
 
     /**
@@ -1516,6 +1550,21 @@ open class LayersCoreHandle:
     }
 
     /**
+     * Report the outcome of a delivery attempt (status `0` = no response /
+     * network error) and get the verdict for the in-flight batch:
+     * `Delivered` (done), `RetryLater` (requeue; next tick retries), or
+     * `Drop` (discard; non-retryable rejection). Feeds the circuit breaker
+     * and Retry-After gate — wrappers must not track these themselves.
+     */
+    open func recordFlushResult(status: UInt16, retryAfterHeader: String?) -> UniFfiFlushDisposition {
+        return try! FfiConverterTypeUniFFIFlushDisposition.lift(try! rustCall {
+            uniffi_layers_core_fn_method_layerscorehandle_record_flush_result(self.uniffiClonePointer(),
+                                                                              FfiConverterUInt16.lower(status),
+                                                                              FfiConverterOptionString.lower(retryAfterHeader), $0)
+        })
+    }
+
+    /**
      * Clear cached flag definitions; the next `/config` fetch will repopulate.
      * Returns `true` if any definitions were dropped.
      */
@@ -1723,6 +1772,18 @@ open class LayersCoreHandle:
         uniffi_layers_core_fn_method_layerscorehandle_set_user_properties_once(self.uniffiClonePointer(),
                                                                                FfiConverterString.lower(propertiesJson), $0)
     }
+    }
+
+    /**
+     * Single delivery gate: privacy (consent/DNT), server-requested
+     * Retry-After delay, and the circuit breaker. Call before each flush
+     * tick, only when there are events to send, and always follow a true
+     * result with `record_flush_result`.
+     */
+    open func shouldAttemptFlush() -> Bool {
+        return try! FfiConverterBool.lift(try! rustCall {
+            uniffi_layers_core_fn_method_layerscorehandle_should_attempt_flush(self.uniffiClonePointer(), $0)
+        })
     }
 
     /**
@@ -2629,6 +2690,77 @@ extension UniFfiError: Foundation.LocalizedError {
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * Verdict for an in-flight batch after a delivery attempt — re-exported
+ * for UniFFI. See [`crate::client::FlushDisposition`].
+ */
+
+public enum UniFfiFlushDisposition {
+    /**
+     * Server accepted the batch (2xx). Done.
+     */
+    case delivered
+    /**
+     * Transient failure — requeue the batch; the next flush tick retries.
+     */
+    case retryLater
+    /**
+     * Permanent rejection — discard the batch and surface the error.
+     */
+    case drop
+}
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeUniFFIFlushDisposition: FfiConverterRustBuffer {
+    typealias SwiftType = UniFfiFlushDisposition
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UniFfiFlushDisposition {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        case 1: return .delivered
+
+        case 2: return .retryLater
+
+        case 3: return .drop
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: UniFfiFlushDisposition, into buf: inout [UInt8]) {
+        switch value {
+        case .delivered:
+            writeInt(&buf, Int32(1))
+
+        case .retryLater:
+            writeInt(&buf, Int32(2))
+
+        case .drop:
+            writeInt(&buf, Int32(3))
+        }
+    }
+}
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+public func FfiConverterTypeUniFFIFlushDisposition_lift(_ buf: RustBuffer) throws -> UniFfiFlushDisposition {
+    return try FfiConverterTypeUniFFIFlushDisposition.lift(buf)
+}
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+public func FfiConverterTypeUniFFIFlushDisposition_lower(_ value: UniFfiFlushDisposition) -> RustBuffer {
+    return FfiConverterTypeUniFFIFlushDisposition.lower(value)
+}
+
+extension UniFfiFlushDisposition: Equatable, Hashable {}
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * Client platform — re-exported for UniFFI.
  */
 
@@ -2990,6 +3122,9 @@ private var initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
+    if uniffi_layers_core_checksum_method_layerscorehandle_abort_flush_attempt() != 60777 {
+        return InitializationResult.apiChecksumMismatch
+    }
     if uniffi_layers_core_checksum_method_layerscorehandle_add_group() != 57581 {
         return InitializationResult.apiChecksumMismatch
     }
@@ -3122,6 +3257,9 @@ private var initializationResult: InitializationResult = {
     if uniffi_layers_core_checksum_method_layerscorehandle_queue_depth() != 24089 {
         return InitializationResult.apiChecksumMismatch
     }
+    if uniffi_layers_core_checksum_method_layerscorehandle_record_flush_result() != 35450 {
+        return InitializationResult.apiChecksumMismatch
+    }
     if uniffi_layers_core_checksum_method_layerscorehandle_reload_feature_flags() != 54150 {
         return InitializationResult.apiChecksumMismatch
     }
@@ -3183,6 +3321,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if uniffi_layers_core_checksum_method_layerscorehandle_set_user_properties_once() != 28344 {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if uniffi_layers_core_checksum_method_layerscorehandle_should_attempt_flush() != 29198 {
         return InitializationResult.apiChecksumMismatch
     }
     if uniffi_layers_core_checksum_method_layerscorehandle_shutdown() != 44265 {

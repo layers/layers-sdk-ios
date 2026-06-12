@@ -12,6 +12,14 @@
       why. Apple validates this file against actual API usage at App
       Store submission — keep it in sync with what the Rust core / Swift
       wrapper actually does.
+
+      Re-audited 2026-06-10 (audit M3): added PurchaseHistory, which the
+      CommerceModule has collected since the StoreKit integration landed.
+
+      NSPrivacyTracking is false today: the SDK does not send data to an
+      ATT-defined tracking endpoint. Flipping it to true (with a dedicated
+      tracking domain, e.g. tr.layers.com, in NSPrivacyTrackingDomains) is
+      a pending product decision blocked on infra — see the audit record.
     -->
 
     <key>NSPrivacyTracking</key>
@@ -41,6 +49,21 @@
         <dict>
             <key>NSPrivacyCollectedDataType</key>
             <string>NSPrivacyCollectedDataTypeProductInteraction</string>
+            <key>NSPrivacyCollectedDataTypeLinked</key>
+            <false/>
+            <key>NSPrivacyCollectedDataTypeTracking</key>
+            <false/>
+            <key>NSPrivacyCollectedDataTypePurposes</key>
+            <array>
+                <string>NSPrivacyCollectedDataTypePurposeAnalytics</string>
+            </array>
+        </dict>
+        <!-- CommerceModule observes StoreKit 1/2 transactions and sends
+             purchase/subscription events (revenue, product_id) — audit M3
+             found this missing from the original declaration. -->
+        <dict>
+            <key>NSPrivacyCollectedDataType</key>
+            <string>NSPrivacyCollectedDataTypePurchaseHistory</string>
             <key>NSPrivacyCollectedDataTypeLinked</key>
             <false/>
             <key>NSPrivacyCollectedDataTypeTracking</key>

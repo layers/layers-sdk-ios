@@ -106,7 +106,9 @@ public final class MetricKitModule: NSObject, @unchecked Sendable {
     // MARK: - MetricKit Payload → $performance Event
 
     #if canImport(MetricKit) && os(iOS)
-    @available(iOS 13.0, *)
+    // Availability must not exceed the enclosing class (iOS 14) — iOS 13
+    // here was a compile error on every iOS build (macOS CI never sees it).
+    @available(iOS 14.0, *)
     func emitMetricPayload(_ payload: MXMetricPayload) {
         let props = Self.metricProperties(from: payload)
         emit("$performance", properties: props)
@@ -140,7 +142,7 @@ public final class MetricKitModule: NSObject, @unchecked Sendable {
     /// tests can hand-roll a payload-shaped dictionary equivalent and assert
     /// on the mapping without instantiating MetricKit types (their initializers
     /// are not public).
-    @available(iOS 13.0, *)
+    @available(iOS 14.0, *)
     static func metricProperties(from payload: MXMetricPayload) -> [String: Any] {
         var props: [String: Any] = [
             "metric_kind": "metric_payload",
@@ -215,7 +217,7 @@ public final class MetricKitModule: NSObject, @unchecked Sendable {
 // MARK: - MXMetricManagerSubscriber
 
 #if canImport(MetricKit) && os(iOS)
-@available(iOS 13.0, *)
+@available(iOS 14.0, *)
 extension MetricKitModule: MXMetricManagerSubscriber {
     public func didReceive(_ payloads: [MXMetricPayload]) {
         for payload in payloads {

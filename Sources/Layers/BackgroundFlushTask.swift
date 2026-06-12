@@ -123,7 +123,7 @@ public enum BackgroundFlushTask {
     // MARK: - Private
 
     #if canImport(BackgroundTasks) && os(iOS)
-    @available(iOS 13.0, *)
+    @available(iOS 14.0, *)
     private static func handleBackgroundTask(_ task: BGTask) {
         // Schedule the next execution before we start work
         scheduleBackgroundFlush()

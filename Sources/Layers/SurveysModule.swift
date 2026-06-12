@@ -25,7 +25,7 @@ import UIKit
 #if canImport(UIKit)
 
 /// Public surveys API exposed via `Layers.shared.surveys`.
-@available(iOS 13.0, tvOS 13.0, macCatalyst 13.0, *)
+@available(iOS 14.0, tvOS 14.0, macCatalyst 14.0, *)
 public final class SurveysModule {
     private let coreProvider: () -> LayersCoreHandle?
 
@@ -240,7 +240,7 @@ struct SurveyAnswerEncodable: Encodable {
 /// Single-survey presentation controller. Renders the question list in a
 /// vertical UIStackView, captures answers, and calls the appropriate callback
 /// on submit or dismiss. Self-contained (no third-party UI deps).
-@available(iOS 13.0, tvOS 13.0, macCatalyst 13.0, *)
+@available(iOS 14.0, tvOS 14.0, macCatalyst 14.0, *)
 final class SurveyViewController: UIViewController {
     private let survey: SurveyDefinitionDecoded
     private let onSubmit: (SurveyResponseEncodable) -> Void
@@ -484,7 +484,7 @@ final class SurveyViewController: UIViewController {
     }
 }
 
-@available(iOS 13.0, tvOS 13.0, macCatalyst 13.0, *)
+@available(iOS 14.0, tvOS 14.0, macCatalyst 14.0, *)
 extension SurveyViewController: UITextViewDelegate {
     func textViewDidChange(_ textView: UITextView) {
         guard let qid = textView.accessibilityIdentifier else { return }

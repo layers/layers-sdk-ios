@@ -347,14 +347,12 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
     /// Cached network status updated by the existing NWPathMonitor. Thread-safe via `lock`.
     private var _isNetworkOnline = true
 
-    // MARK: - Retry-After State
-
-    /// The `Date` until which flushes should be skipped (server-requested Retry-After).
-    /// Only accessed on `_flushQueue` (serial) so no additional lock is needed.
-    private var _retryAfterDeadline: Date?
-
-    /// Maximum Retry-After delay the SDK will honour (5 minutes), matching the Rust core.
-    static let retryAfterMaxSecs: TimeInterval = 300
+    // NOTE: the wrapper-side Retry-After gate (`_retryAfterDeadline`,
+    // `parseRetryAfterHeader`, …) and exponential backoff loop were
+    // removed: delivery policy (Retry-After, circuit breaker, retry/drop
+    // verdicts) lives in the Rust core — see
+    // adr/0001-rust-owned-delivery-policy.md. The raw Retry-After header
+    // is forwarded to `core.recordFlushResult` unparsed.
 
     /// Timer for periodic remote config polling (every 300s).
     private var _configTimer: DispatchSourceTimer?
@@ -370,6 +368,16 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
     /// Registered listeners keyed by id. The dispose closure looks up by id
     /// rather than by closure equality (closures aren't Equatable).
     private var _featureFlagListeners: [UInt64: ([String: FeatureFlagValue]) -> Void] = [:]
+    /// Monotonic init generation. Bumped by initialize() and shutdown() so
+    /// the deferred init chain can detect that the instance it was started
+    /// for is gone — a stale chain must not fire attribution/auto-capture
+    /// against a NEW core after shutdown()+initialize() (duplicate
+    /// startup events).
+    private var _initGeneration: UInt64 = 0
+    /// Listener ids that have already received at least one snapshot.
+    /// Lets the deferred post-init fire skip listeners that got their
+    /// immediate registration callback when nothing changed since.
+    private var _featureFlagListenersFired: Set<UInt64> = []
 
     /// SKAdNetwork integration (iOS only).
     public let skan = SKANModule()
@@ -396,7 +404,10 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
     public let screenTracking = ScreenTrackingModule()
     /// Tier 8 — In-product surveys & messaging (iOS only).
     #if canImport(UIKit)
-    @available(iOS 13.0, tvOS 13.0, macCatalyst 13.0, *)
+    // Availability must not exceed the enclosing class (iOS 14/tvOS 14) —
+    // declaring iOS 13 here was a compile error on every iOS build, which
+    // macOS-only CI never exercised.
+    @available(iOS 14.0, tvOS 14.0, macCatalyst 14.0, *)
     public lazy var surveys: SurveysModule = SurveysModule(coreProvider: { [weak self] in
         return self?.core
     })
@@ -531,6 +542,8 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
         _anonymousId = _anonymousId ?? UUID().uuidString
         _isInitialized = true
         _isInitializing = false
+        _initGeneration &+= 1
+        let initGeneration = _initGeneration
         _enableDebug = config.enableDebug
         _configAppId = config.appId
         _configEnvironment = config.environment
@@ -544,7 +557,40 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
             queue: nil
         ) { [weak self] _ in
             guard let self = self else { return }
-            Task { await self.flush() }
+            // Crash-safety first: synchronously snapshot the queue to disk.
+            // The core's flush() is the non-draining rolling snapshot (one
+            // small file write, no network) — if iOS kills the suspended
+            // process, events survive to the next launch instead of dying
+            // with the in-memory queue (audit H2). Persistence previously
+            // only happened in shutdown(), which iOS essentially never
+            // calls.
+            if let core = self.lockedCoreIfInitialized() {
+                try? core.flush()
+            }
+            // Then the best-effort network flush, wrapped in a UIKit
+            // background task so iOS grants time to finish the POST after
+            // the app leaves the foreground — a bare Task gets suspended
+            // mid-request and the batch waits for the next launch.
+            let endLock = NSLock()
+            var ended = false
+            var taskId = UIBackgroundTaskIdentifier.invalid
+            let endTask = {
+                endLock.lock()
+                let shouldEnd = !ended && taskId != .invalid
+                ended = true
+                endLock.unlock()
+                if shouldEnd {
+                    UIApplication.shared.endBackgroundTask(taskId)
+                }
+            }
+            taskId = UIApplication.shared.beginBackgroundTask(
+                withName: "com.layers.background-flush",
+                expirationHandler: endTask
+            )
+            Task {
+                _ = await self.flush()
+                endTask()
+            }
         }
         lock.lock()
         _backgroundObserver = observer
@@ -558,43 +604,102 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
 
         #endif
 
-        // Fetch remote config synchronously (up to 2s) so we can check clipboard_attribution_enabled
-        fetchRemoteConfigSync(timeoutSecs: 2.0)
+        // Fetch remote config OFF the calling thread (audit M-finding: the
+        // sync fetch blocked the caller — typically the main thread — for
+        // up to 2s on every cold start). The chain that depends on the
+        // config result runs in order on a utility queue; UIKit-bound work
+        // (UIPasteboard read in attribution, swizzling/observers in the
+        // Tier 2 attach) hops back to main, preserving the documented
+        // event order: legacy `app_open` with attribution first, then the
+        // lifecycle module layers on the canonical `$app_open`.
+        // BEHAVIOR NOTE (deliberate): initialize() now returns before this
+        // chain runs, so events tracked immediately after init may precede
+        // the attribution-bearing `app_open` and the Tier 2 auto-capture
+        // wiring in queue order. That trade replaces a 2s main-thread stall
+        // on every cold start; analytics correctness is unaffected because
+        // the server orders by event timestamp, not arrival.
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self = self else { return }
+            // Flag state as seeded by the bootstrap, BEFORE the fetch —
+            // used below to detect whether the fetch changed anything.
+            let bootstrapSnapshot = self.getAllFlags()
+            self.fetchRemoteConfigSync(timeoutSecs: 2.0)
 
-        // Tier 4: any listeners registered before initialize() are now safe to
-        // fire — bootstrap (if any) has been seeded and the remote config
-        // fetch has populated server-side flag definitions.
-        if config.featureFlagBootstrap != nil {
-            fireFeatureFlagListeners()
+            // The host may have shut the SDK down (or shut down AND
+            // re-initialized) while the fetch ran. Re-resolve the core and
+            // verify this chain still belongs to the live init generation —
+            // a stale chain running against a NEW core would fire duplicate
+            // startup events.
+            guard let core = self.lockedCoreIfInitialized(),
+                  self.currentInitGeneration() == initGeneration else { return }
+
+            // Tier 4: listeners are now safe to fire — bootstrap (if any)
+            // has been seeded and the remote config fetch has populated
+            // server-side definitions. Runs for non-bootstrap apps too:
+            // with the non-blocking init, a listener registered right
+            // after initialize() may have seen empty flags at registration
+            // (no immediate callback) and would otherwise never hear about
+            // server-side flags (BugBot). Fire on main (UI callbacks). If
+            // the fetch didn't change flag state, only never-fired
+            // listeners are called — post-init registrants that already
+            // got their registration snapshot aren't called twice.
+            let snapshotAfterFetch = self.getAllFlags()
+            let changed = snapshotAfterFetch != bootstrapSnapshot
+            if changed || !snapshotAfterFetch.isEmpty {
+                DispatchQueue.main.async { [weak self] in
+                    guard let self = self,
+                          self.currentInitGeneration() == initGeneration else { return }
+                    self.fireFeatureFlagListeners(onlyUnfired: !changed)
+                }
+            }
+
+            // Read remote config and apply server-driven settings
+            let clipboardEnabled: Bool
+            let remoteConfigDict: [String: Any]?
+            if let configJson = try? core.getRemoteConfigJson(),
+               let data = configJson.data(using: .utf8),
+               let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                remoteConfigDict = parsed
+                clipboardEnabled = parsed["clipboard_attribution_enabled"] as? Bool ?? false
+            } else {
+                remoteConfigDict = nil
+                clipboardEnabled = false
+            }
+
+            // Auto-configure SKAN from remote config (iOS only).
+            // The server's remote config `skan` section drives preset/rules
+            // so consumers don't need to call skan.setPreset() manually.
+            // Generation re-check: never apply stale server data to a NEW
+            // instance after a mid-chain shutdown()+initialize().
+            #if os(iOS)
+            guard self.currentInitGeneration() == initGeneration else { return }
+            self.configureSkanFromRemoteConfig(remoteConfigDict)
+            #endif
+
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                // Re-resolve again — shutdown/re-init may have raced the
+                // main hop.
+                guard let core = self.lockedCoreIfInitialized(),
+                      self.currentInitGeneration() == initGeneration else { return }
+                // Collect attribution signals and fire app_open with them
+                // (if enabled). Reads UIPasteboard — main thread only.
+                self.trackAttributionSignals(
+                    core: core,
+                    clipboardAttributionEnabled: clipboardEnabled,
+                    autoTrackAppOpen: config.autoTrackAppOpen
+                )
+            }
         }
 
-        // Read remote config and apply server-driven settings
-        let clipboardEnabled: Bool
-        let remoteConfigDict: [String: Any]?
-        if let configJson = try? handle.getRemoteConfigJson(),
-           let data = configJson.data(using: .utf8),
-           let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-            remoteConfigDict = parsed
-            clipboardEnabled = parsed["clipboard_attribution_enabled"] as? Bool ?? false
-        } else {
-            remoteConfigDict = nil
-            clipboardEnabled = false
-        }
-
-        // Auto-configure SKAN from remote config (iOS only).
-        // The server's remote config `skan` section drives preset/rules so consumers
-        // don't need to call skan.setPreset() manually.
-        #if os(iOS)
-        configureSkanFromRemoteConfig(remoteConfigDict)
-        #endif
-
-        // Collect attribution signals and fire app_open with them (if enabled)
-        trackAttributionSignals(core: handle, clipboardAttributionEnabled: clipboardEnabled, autoTrackAppOpen: config.autoTrackAppOpen)
-
-        // Tier 2: lifecycle / screen / purchase auto-capture.
-        // Wire these AFTER attribution so the legacy `app_open` event fires first
-        // (it carries attribution context); the lifecycle module then layers on
-        // the canonical `$app_open` and friends.
+        // Tier 2: lifecycle / screen / purchase auto-capture is wired
+        // SYNCHRONOUSLY — it is pure observer registration / swizzling
+        // (no network), and deferring it let UIKit lifecycle
+        // notifications fire before observers existed, which broke the
+        // LifecycleModule's cold-start dedup and skipped the first real
+        // return-to-foreground `$app_open` (BugBot). The attribution
+        // `app_open` above is the only piece that waits on the config
+        // fetch; see the ordering note at the top of the deferred chain.
         if config.automaticLifecycleTrackingEnabled {
             lifecycle.attach(sdk: self)
         }
@@ -902,6 +1007,9 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
         // Fire once with the current snapshot if the SDK is already up.
         let snapshot = getAllFlags()
         if !snapshot.isEmpty {
+            lock.lock()
+            _featureFlagListenersFired.insert(id)
+            lock.unlock()
             callback(snapshot)
         }
 
@@ -909,21 +1017,41 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
             guard let self = self else { return }
             self.lock.lock()
             self._featureFlagListeners.removeValue(forKey: id)
+            self._featureFlagListenersFired.remove(id)
             self.lock.unlock()
         }
     }
 
     // MARK: - Internal Feature-Flag Helpers
 
+    /// Current init generation under the lock (see `_initGeneration`).
+    private func currentInitGeneration() -> UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return _initGeneration
+    }
+
     /// Snapshot all listeners and call them with the current flag map.
     /// Always uses `getAllFlags()` so each listener sees a consistent view.
-    func fireFeatureFlagListeners() {
+    /// Fire listeners with the current flag snapshot.
+    ///
+    /// `onlyUnfired: true` restricts the fire to listeners that have never
+    /// received a snapshot — used by the deferred post-init fire when the
+    /// config fetch didn't change flag state, so a listener registered
+    /// right after init (which already got its immediate registration
+    /// callback) isn't called twice with identical data.
+    func fireFeatureFlagListeners(onlyUnfired: Bool = false) {
         lock.lock()
-        let listeners = Array(_featureFlagListeners.values)
+        let entries = _featureFlagListeners.filter { id, _ in
+            !onlyUnfired || !_featureFlagListenersFired.contains(id)
+        }
+        for id in entries.keys {
+            _featureFlagListenersFired.insert(id)
+        }
         lock.unlock()
-        if listeners.isEmpty { return }
+        if entries.isEmpty { return }
         let snapshot = getAllFlags()
-        for listener in listeners {
+        for listener in entries.values {
             listener(snapshot)
         }
     }
@@ -1688,8 +1816,6 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
 
     // MARK: - Flush & Reset
 
-    /// Maximum number of retry attempts for a single batch delivery.
-    private static let maxRetries = 3
     /// Default batch size for drain operations.
     private static let defaultBatchSize: UInt32 = 1000
 
@@ -1749,31 +1875,42 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
 
     /// Core drain-and-deliver loop. Must be called on `_flushQueue` (serial).
     /// The serial queue guarantees mutual exclusion — no additional lock needed.
-    /// Drains a batch from the Rust queue, sends via URLSession with retry,
-    /// and requeues events on exhausted retries.
     ///
-    /// Retry-After handling:
-    /// - Before draining, checks `_retryAfterDeadline` — skips flush if active.
-    /// - On 429/503 responses, reads the `Retry-After` header and sets the deadline.
-    /// - On 2xx responses, clears the deadline.
+    /// Delivery policy lives in the Rust core (adr/0001-rust-owned-delivery-policy.md):
+    /// one pre-flight gate (consent/DNT + Retry-After + circuit breaker via
+    /// `shouldAttemptFlush`), one HTTP attempt, one post-flight report
+    /// (`recordFlushResult`) whose verdict decides requeue vs drop. No
+    /// wrapper-side retry loops or backoff — the next flush tick retries,
+    /// gated by the core.
     private func deliverBatch(core: LayersCoreHandle) -> SafeResult<Void> {
-        // Check Retry-After gate — skip flush if the server told us to wait
-        if isRetryAfterActive() {
-            let remainingMs = retryAfterRemainingMs()
+        // Gate only when there's something to send: shouldAttemptFlush()
+        // may claim the circuit breaker's half-open probe slot, which an
+        // idle tick must not consume.
+        if core.queueDepth() == 0 {
+            return .success(())
+        }
+        if !core.shouldAttemptFlush() {
             if enableDebug {
-                os_log("Flush skipped — Retry-After gate active (remaining: %llu ms)", log: Self.log, type: .debug, remainingMs)
+                os_log("Flush skipped — core delivery gate closed", log: Self.log, type: .debug)
             }
             return .success(()) // Events stay in queue for later
         }
+
+        // After a passed gate, EVERY pre-wire abort path must call
+        // abortFlushAttempt() — it releases a claimed half-open breaker
+        // probe WITHOUT counting a delivery failure (no request was made,
+        // so neither success nor failure is true).
 
         // Drain a batch from the Rust queue
         let batchJson: String
         do {
             guard let json = try core.drainBatch(count: Self.defaultBatchSize) else {
-                return .success(()) // Queue empty
+                core.abortFlushAttempt()
+                return .success(()) // Queue raced empty
             }
             batchJson = json
         } catch {
+            core.abortFlushAttempt()
             let mapped = Self.mapError(error)
             reportError(method: "flush", error: mapped)
             return .failure(mapped)
@@ -1787,6 +1924,7 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
             headersJson = try core.flushHeadersJson()
         } catch {
             // Cannot deliver without URL/headers — requeue events
+            core.abortFlushAttempt()
             requeueSilently(core: core, batchJson: batchJson)
             let mapped = Self.mapError(error)
             reportError(method: "flush", error: mapped)
@@ -1794,6 +1932,7 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
         }
 
         guard let url = URL(string: urlString) else {
+            core.abortFlushAttempt()
             requeueSilently(core: core, batchJson: batchJson)
             let err = LayersError.networkError("Invalid events URL: \(urlString)")
             reportError(method: "flush", error: err)
@@ -1806,81 +1945,69 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
         request.timeoutInterval = 10
         request.httpBody = batchJson.data(using: .utf8)
         guard Self.applyHeaders(from: headersJson, to: &request) else {
+            core.abortFlushAttempt()
             requeueSilently(core: core, batchJson: batchJson)
             let err = LayersError.networkError("Failed to parse flush headers")
             reportError(method: "flush", error: err)
             return .failure(err)
         }
 
-        // Retry loop with exponential backoff + jitter
-        for attempt in 0..<Self.maxRetries {
-            let semaphore = DispatchSemaphore(value: 0)
-            var httpResponse: HTTPURLResponse?
-            var networkError: Error?
+        // One attempt; the verdict for anything other than 2xx comes from
+        // the core. A missing response (network error / timeout) is
+        // reported as status 0.
+        let semaphore = DispatchSemaphore(value: 0)
+        var httpResponse: HTTPURLResponse?
+        var networkError: Error?
 
-            let task = URLSession.shared.dataTask(with: request) { _, response, error in
-                networkError = error
-                httpResponse = response as? HTTPURLResponse
-                semaphore.signal()
-            }
-            task.resume()
-            semaphore.wait()
+        let task = URLSession.shared.dataTask(with: request) { _, response, error in
+            networkError = error
+            httpResponse = response as? HTTPURLResponse
+            semaphore.signal()
+        }
+        task.resume()
+        semaphore.wait()
 
-            if let error = networkError {
-                os_log("Flush attempt %d failed (network): %{public}@", log: Self.log, type: .error, attempt + 1, error.localizedDescription)
-                if attempt < Self.maxRetries - 1 {
-                    // Use usleep instead of Thread.sleep to avoid blocking a GCD
-                    // thread-pool thread. This runs on the dedicated serial _flushQueue,
-                    // so blocking is acceptable but usleep is lighter-weight.
-                    usleep(UInt32(Self.retryDelay(attempt: attempt) * 1_000_000))
-                    continue
-                }
-            } else if let response = httpResponse {
-                let status = response.statusCode
-
-                if status >= 200 && status < 300 {
-                    // Success — clear Retry-After gate
-                    clearRetryAfter()
-                    recordFlushResult(success: true, message: "HTTP \(status)")
-                    if enableDebug {
-                        os_log("Flush succeeded (HTTP %d)", log: Self.log, type: .debug, status)
-                    }
-                    return .success(())
-                }
-
-                if status == 429 || (status >= 500 && status < 600) {
-                    // Retryable — check for Retry-After header
-                    if status == 429 || status == 503 {
-                        let retryAfterHeader = response.value(forHTTPHeaderField: "Retry-After")
-                        updateRetryAfter(status: status, retryAfterHeader: retryAfterHeader)
-                    }
-
-                    os_log("Flush attempt %d: HTTP %d (retryable)", log: Self.log, type: .error, attempt + 1, status)
-                    if attempt < Self.maxRetries - 1 {
-                        // Use usleep instead of Thread.sleep to avoid blocking a GCD
-                        // thread-pool thread. This runs on the dedicated serial _flushQueue,
-                        // so blocking is acceptable but usleep is lighter-weight.
-                        usleep(UInt32(Self.retryDelay(attempt: attempt) * 1_000_000))
-                        continue
-                    }
-                } else {
-                    // Non-retryable (4xx other than 429) — drop events
-                    os_log("Flush failed: HTTP %d (non-retryable, events dropped)", log: Self.log, type: .error, status)
-                    recordFlushResult(success: false, message: "HTTP \(status)")
-                    let err = LayersError.networkError("HTTP \(status)")
-                    reportError(method: "flush", error: err)
-                    return .failure(err)
-                }
-            }
+        let status = httpResponse?.statusCode ?? 0
+        let retryAfterHeader = httpResponse?.value(forHTTPHeaderField: "Retry-After")
+        if let error = networkError {
+            os_log("Flush failed (network): %{public}@", log: Self.log, type: .error, error.localizedDescription)
         }
 
-        // All retries exhausted — requeue events
-        os_log("Flush: all retries exhausted, requeuing events", log: Self.log, type: .error)
-        requeueSilently(core: core, batchJson: batchJson)
-        recordFlushResult(success: false, message: "retries exhausted")
-        let err = LayersError.networkError("All retries exhausted")
-        reportError(method: "flush", error: err)
-        return .failure(err)
+        let verdict = core.recordFlushResult(
+            status: UInt16(clamping: status),
+            retryAfterHeader: retryAfterHeader
+        )
+        switch verdict {
+        case .delivered:
+            recordFlushResult(success: true, message: "HTTP \(status)")
+            if enableDebug {
+                os_log("Flush succeeded (HTTP %d)", log: Self.log, type: .debug, status)
+            }
+            return .success(())
+        case .retryLater:
+            // Transient — put the batch back; the next flush tick retries,
+            // gated by the core's Retry-After guard and circuit breaker.
+            // This is normal deferral, NOT a failure: no error callback
+            // (parity with Kotlin/Flutter — spurious flush errors on every
+            // flaky-network tick train apps to ignore the error listener).
+            requeueSilently(core: core, batchJson: batchJson)
+            let message = status == 0
+                ? (networkError?.localizedDescription ?? "network error")
+                : "HTTP \(status)"
+            recordFlushResult(success: false, message: message)
+            if enableDebug {
+                os_log("Flush deferred (%{public}@), batch requeued", log: Self.log, type: .debug, message)
+            }
+            return .success(())
+        case .drop:
+            // Permanent rejection — identical bytes cannot succeed later;
+            // retrying would wedge the queue behind a poison batch.
+            os_log("Flush failed: HTTP %d (non-retryable, events dropped)", log: Self.log, type: .error, status)
+            recordFlushResult(success: false, message: "HTTP \(status)")
+            let err = LayersError.networkError("HTTP \(status)")
+            reportError(method: "flush", error: err)
+            return .failure(err)
+        }
     }
 
     /// Requeue a drained batch back into the Rust core queue. Errors are swallowed.
@@ -1890,93 +2017,6 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
         } catch {
             os_log("Requeue failed: %{public}@", log: Self.log, type: .error, error.localizedDescription)
         }
-    }
-
-    /// Calculate retry delay: base 1s, multiply by 2^attempt, add jitter 0-250ms, cap at 30s.
-    private static func retryDelay(attempt: Int) -> TimeInterval {
-        let base = 1.0 * pow(2.0, Double(attempt))
-        let delay = base
-        let jitter = delay * 0.25 * Double.random(in: 0...1.0)
-        return min(delay + jitter, 30.0)
-    }
-
-    // MARK: - Retry-After Helpers
-
-    /// Parse a `Retry-After` header value into seconds.
-    /// Supports integer seconds (e.g. "60") and HTTP-date format
-    /// (e.g. "Wed, 21 Oct 2015 07:28:00 GMT"). Returns `nil` if unparseable.
-    /// Caps at `retryAfterMaxSecs` (300s / 5 minutes).
-    static func parseRetryAfterHeader(_ value: String?) -> TimeInterval? {
-        guard let value = value?.trimmingCharacters(in: .whitespaces), !value.isEmpty else {
-            return nil
-        }
-
-        // Try parsing as integer seconds first (most common).
-        // RFC 7231 specifies delay-seconds as an integer; reject fractional values
-        // (e.g. "1.5") for consistency with the Rust core implementation.
-        if let seconds = Int(value), seconds > 0 {
-            return min(Double(seconds), retryAfterMaxSecs)
-        }
-
-        // Try parsing as HTTP-date (RFC 7231)
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = TimeZone(abbreviation: "GMT")
-        // Preferred format: "Sun, 06 Nov 1994 08:49:37 GMT"
-        formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
-        if let date = formatter.date(from: value) {
-            let delay = date.timeIntervalSinceNow
-            if delay > 0 {
-                return min(delay, retryAfterMaxSecs)
-            }
-            return nil // Date is in the past
-        }
-
-        return nil
-    }
-
-    /// Update the Retry-After gate from an HTTP response.
-    /// Only activates for 429 or 503 responses with a valid `Retry-After` header.
-    @discardableResult
-    func updateRetryAfter(status: Int, retryAfterHeader: String?) -> TimeInterval? {
-        guard status == 429 || status == 503 else { return nil }
-
-        guard let delaySecs = Self.parseRetryAfterHeader(retryAfterHeader) else {
-            return nil
-        }
-
-        _retryAfterDeadline = Date().addingTimeInterval(delaySecs)
-        if enableDebug {
-            os_log("Retry-After gate set: %.0fs (until %{public}@)", log: Self.log, type: .debug, delaySecs, String(describing: _retryAfterDeadline))
-        }
-        return delaySecs
-    }
-
-    /// Clear the Retry-After gate (e.g. after a successful flush).
-    func clearRetryAfter() {
-        _retryAfterDeadline = nil
-    }
-
-    /// Check whether a server-requested Retry-After delay is currently active.
-    func isRetryAfterActive() -> Bool {
-        guard let deadline = _retryAfterDeadline else { return false }
-        if Date() >= deadline {
-            // Deadline has passed — auto-clear
-            _retryAfterDeadline = nil
-            return false
-        }
-        return true
-    }
-
-    /// Return the remaining Retry-After delay in milliseconds, or 0.
-    func retryAfterRemainingMs() -> UInt64 {
-        guard let deadline = _retryAfterDeadline else { return 0 }
-        let remaining = deadline.timeIntervalSinceNow
-        if remaining <= 0 {
-            _retryAfterDeadline = nil
-            return 0
-        }
-        return UInt64(remaining * 1000)
     }
 
     /// Reset the SDK state, clearing user identity and properties.
@@ -2057,8 +2097,8 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
             #endif
             commerce.detach()
 
-            // Clear Retry-After gate
-            clearRetryAfter()
+            // (Delivery-policy state — Retry-After gate, circuit breaker —
+            // lives in the Rust core and dies with the handle below.)
 
             lock.lock()
             _core = nil
@@ -2078,6 +2118,9 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
             _recentEvents = []
             _lastFlushResult = nil
             _featureFlagListeners.removeAll()
+            _featureFlagListenersFired.removeAll()
+            // Kill any in-flight deferred init chain from this instance.
+            _initGeneration &+= 1
             lock.unlock()
 
             #if canImport(UIKit) && !os(watchOS)
@@ -2174,7 +2217,7 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
 
         let task = URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
             defer { group.leave() }
-            guard self != nil else { return }
+            guard let self = self else { return }
 
             if let error = error {
                 os_log("Config fetch (sync) failed: %{public}@", log: Self.log, type: .error, error.localizedDescription)
@@ -2182,6 +2225,11 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
             }
 
             guard let httpResponse = response as? HTTPURLResponse else { return }
+
+            // Re-resolve: initialize() may have returned and shutdown() run
+            // while the request was in flight — never apply the response to
+            // a shut-down core (the captured handle outlives it).
+            guard let core = self.lockedCoreIfInitialized() else { return }
 
             switch httpResponse.statusCode {
             case 200:
@@ -2192,7 +2240,7 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
                 let responseEtag = httpResponse.value(forHTTPHeaderField: "ETag")
                 do {
                     try core.updateRemoteConfig(configJson: body, etag: responseEtag)
-                    if self?.enableDebug == true {
+                    if self.enableDebug {
                         os_log("Remote config updated (sync, ETag: %{public}@)", log: Self.log, type: .debug, responseEtag ?? "nil")
                     }
                 } catch {
@@ -2201,7 +2249,7 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
             case 304:
                 do {
                     try core.markConfigNotModified()
-                    if self?.enableDebug == true {
+                    if self.enableDebug {
                         os_log("Remote config not modified (sync, 304)", log: Self.log, type: .debug)
                     }
                 } catch {
