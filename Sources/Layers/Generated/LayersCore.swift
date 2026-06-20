@@ -398,6 +398,22 @@ private class UniffiHandleMap<T> {
 #if swift(>=5.8)
     @_documentation(visibility: private)
 #endif
+private struct FfiConverterUInt8: FfiConverterPrimitive {
+    typealias FfiType = UInt8
+    typealias SwiftType = UInt8
+
+    static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UInt8 {
+        return try lift(readInt(&buf))
+    }
+
+    static func write(_ value: UInt8, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
 private struct FfiConverterUInt16: FfiConverterPrimitive {
     typealias FfiType = UInt16
     typealias SwiftType = UInt16
@@ -950,6 +966,50 @@ public protocol LayersCoreHandleProtocol: AnyObject {
      * Gracefully shut down: persist remaining events, stop processing.
      */
     func shutdown() throws
+
+    /**
+     * Apply the `skan` block from the cached remote config (no-op if absent).
+     */
+    func skanConfigureFromRemoteConfig() throws
+
+    /**
+     * The active SKAN preset name, or `None` if unconfigured.
+     */
+    func skanCurrentPreset() -> String?
+
+    /**
+     * The highest SKAN conversion value posted so far (monotonic).
+     */
+    func skanCurrentValue() -> UInt8
+
+    /**
+     * Whether SKAN is currently enabled. Drives whether the wrapper arms.
+     */
+    func skanIsEnabled() -> Bool
+
+    /**
+     * Evaluate an event against the SKAN rules. Returns the OS-level update to
+     * apply, or `None` if nothing changed. `properties_json` may be `None`/`"{}"`.
+     */
+    func skanProcessEvent(eventName: String, propertiesJson: String?) throws -> SkanConversionUpdate?
+
+    /**
+     * Report the outcome of applying a SKAN update from `skan_process_event`.
+     * On `success` the monotonic floor advances to `value` and is persisted; on
+     * failure nothing changes so the next matching event re-issues the update.
+     * Call this after the native `updatePostbackConversionValue` succeeds/fails.
+     */
+    func skanRecordConversionResult(value: UInt8, success: Bool) throws
+
+    /**
+     * Load a built-in SKAN preset: `subscriptions`, `engagement`, or `iap`.
+     */
+    func skanSetPreset(preset: String) throws
+
+    /**
+     * Replace the active SKAN rules with a custom JSON array.
+     */
+    func skanSetRules(rulesJson: String) throws
 
     /**
      * Submit a survey response — emits `survey sent` auto-event with the
@@ -1795,6 +1855,84 @@ open class LayersCoreHandle:
     }
 
     /**
+     * Apply the `skan` block from the cached remote config (no-op if absent).
+     */
+    open func skanConfigureFromRemoteConfig() throws { try rustCallWithError(FfiConverterTypeUniFFIError.lift) {
+        uniffi_layers_core_fn_method_layerscorehandle_skan_configure_from_remote_config(self.uniffiClonePointer(), $0)
+    }
+    }
+
+    /**
+     * The active SKAN preset name, or `None` if unconfigured.
+     */
+    open func skanCurrentPreset() -> String? {
+        return try! FfiConverterOptionString.lift(try! rustCall {
+            uniffi_layers_core_fn_method_layerscorehandle_skan_current_preset(self.uniffiClonePointer(), $0)
+        })
+    }
+
+    /**
+     * The highest SKAN conversion value posted so far (monotonic).
+     */
+    open func skanCurrentValue() -> UInt8 {
+        return try! FfiConverterUInt8.lift(try! rustCall {
+            uniffi_layers_core_fn_method_layerscorehandle_skan_current_value(self.uniffiClonePointer(), $0)
+        })
+    }
+
+    /**
+     * Whether SKAN is currently enabled. Drives whether the wrapper arms.
+     */
+    open func skanIsEnabled() -> Bool {
+        return try! FfiConverterBool.lift(try! rustCall {
+            uniffi_layers_core_fn_method_layerscorehandle_skan_is_enabled(self.uniffiClonePointer(), $0)
+        })
+    }
+
+    /**
+     * Evaluate an event against the SKAN rules. Returns the OS-level update to
+     * apply, or `None` if nothing changed. `properties_json` may be `None`/`"{}"`.
+     */
+    open func skanProcessEvent(eventName: String, propertiesJson: String?) throws -> SkanConversionUpdate? {
+        return try FfiConverterOptionTypeSkanConversionUpdate.lift(rustCallWithError(FfiConverterTypeUniFFIError.lift) {
+            uniffi_layers_core_fn_method_layerscorehandle_skan_process_event(self.uniffiClonePointer(),
+                                                                             FfiConverterString.lower(eventName),
+                                                                             FfiConverterOptionString.lower(propertiesJson), $0)
+        })
+    }
+
+    /**
+     * Report the outcome of applying a SKAN update from `skan_process_event`.
+     * On `success` the monotonic floor advances to `value` and is persisted; on
+     * failure nothing changes so the next matching event re-issues the update.
+     * Call this after the native `updatePostbackConversionValue` succeeds/fails.
+     */
+    open func skanRecordConversionResult(value: UInt8, success: Bool) throws { try rustCallWithError(FfiConverterTypeUniFFIError.lift) {
+        uniffi_layers_core_fn_method_layerscorehandle_skan_record_conversion_result(self.uniffiClonePointer(),
+                                                                                    FfiConverterUInt8.lower(value),
+                                                                                    FfiConverterBool.lower(success), $0)
+    }
+    }
+
+    /**
+     * Load a built-in SKAN preset: `subscriptions`, `engagement`, or `iap`.
+     */
+    open func skanSetPreset(preset: String) throws { try rustCallWithError(FfiConverterTypeUniFFIError.lift) {
+        uniffi_layers_core_fn_method_layerscorehandle_skan_set_preset(self.uniffiClonePointer(),
+                                                                      FfiConverterString.lower(preset), $0)
+    }
+    }
+
+    /**
+     * Replace the active SKAN rules with a custom JSON array.
+     */
+    open func skanSetRules(rulesJson: String) throws { try rustCallWithError(FfiConverterTypeUniFFIError.lift) {
+        uniffi_layers_core_fn_method_layerscorehandle_skan_set_rules(self.uniffiClonePointer(),
+                                                                     FfiConverterString.lower(rulesJson), $0)
+    }
+    }
+
+    /**
      * Submit a survey response — emits `survey sent` auto-event with the
      * answers attached. `response_json` is a `SurveyResponse` JSON object.
      */
@@ -1956,6 +2094,80 @@ public func FfiConverterTypeLayersCoreHandle_lift(_ pointer: UnsafeMutableRawPoi
 #endif
 public func FfiConverterTypeLayersCoreHandle_lower(_ value: LayersCoreHandle) -> UnsafeMutableRawPointer {
     return FfiConverterTypeLayersCoreHandle.lower(value)
+}
+
+/**
+ * SKAN conversion-value update for UniFFI consumers. Returned by
+ * `skan_process_event` when the value increases; the wrapper applies it via
+ * `SKAdNetwork.updatePostbackConversionValue`.
+ */
+public struct SkanConversionUpdate {
+    public let fineValue: UInt8
+    public let coarseValue: String?
+    public let lockWindow: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(fineValue: UInt8, coarseValue: String?, lockWindow: Bool) {
+        self.fineValue = fineValue
+        self.coarseValue = coarseValue
+        self.lockWindow = lockWindow
+    }
+}
+
+extension SkanConversionUpdate: Equatable, Hashable {
+    public static func == (lhs: SkanConversionUpdate, rhs: SkanConversionUpdate) -> Bool {
+        if lhs.fineValue != rhs.fineValue {
+            return false
+        }
+        if lhs.coarseValue != rhs.coarseValue {
+            return false
+        }
+        if lhs.lockWindow != rhs.lockWindow {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(fineValue)
+        hasher.combine(coarseValue)
+        hasher.combine(lockWindow)
+    }
+}
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSkanConversionUpdate: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SkanConversionUpdate {
+        return
+            try SkanConversionUpdate(
+                fineValue: FfiConverterUInt8.read(from: &buf),
+                coarseValue: FfiConverterOptionString.read(from: &buf),
+                lockWindow: FfiConverterBool.read(from: &buf)
+            )
+    }
+
+    public static func write(_ value: SkanConversionUpdate, into buf: inout [UInt8]) {
+        FfiConverterUInt8.write(value.fineValue, into: &buf)
+        FfiConverterOptionString.write(value.coarseValue, into: &buf)
+        FfiConverterBool.write(value.lockWindow, into: &buf)
+    }
+}
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSkanConversionUpdate_lift(_ buf: RustBuffer) throws -> SkanConversionUpdate {
+    return try FfiConverterTypeSkanConversionUpdate.lift(buf)
+}
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSkanConversionUpdate_lower(_ value: SkanConversionUpdate) -> RustBuffer {
+    return FfiConverterTypeSkanConversionUpdate.lower(value)
 }
 
 /**
@@ -3060,6 +3272,30 @@ private struct FfiConverterOptionString: FfiConverterRustBuffer {
 #if swift(>=5.8)
     @_documentation(visibility: private)
 #endif
+private struct FfiConverterOptionTypeSkanConversionUpdate: FfiConverterRustBuffer {
+    typealias SwiftType = SkanConversionUpdate?
+
+    static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeSkanConversionUpdate.write(value, into: &buf)
+    }
+
+    static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeSkanConversionUpdate.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
 private struct FfiConverterOptionTypeUniFFIPlatform: FfiConverterRustBuffer {
     typealias SwiftType = UniFfiPlatform?
 
@@ -3327,6 +3563,30 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if uniffi_layers_core_checksum_method_layerscorehandle_shutdown() != 44265 {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if uniffi_layers_core_checksum_method_layerscorehandle_skan_configure_from_remote_config() != 25637 {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if uniffi_layers_core_checksum_method_layerscorehandle_skan_current_preset() != 31834 {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if uniffi_layers_core_checksum_method_layerscorehandle_skan_current_value() != 41346 {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if uniffi_layers_core_checksum_method_layerscorehandle_skan_is_enabled() != 34719 {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if uniffi_layers_core_checksum_method_layerscorehandle_skan_process_event() != 51214 {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if uniffi_layers_core_checksum_method_layerscorehandle_skan_record_conversion_result() != 57761 {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if uniffi_layers_core_checksum_method_layerscorehandle_skan_set_preset() != 48461 {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if uniffi_layers_core_checksum_method_layerscorehandle_skan_set_rules() != 14813 {
         return InitializationResult.apiChecksumMismatch
     }
     if uniffi_layers_core_checksum_method_layerscorehandle_submit_survey_response() != 15904 {

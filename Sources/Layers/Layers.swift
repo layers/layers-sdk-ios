@@ -762,14 +762,18 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
             os_log("track('%{public}@', properties: %d keys)", log: Self.log, type: .debug, event, properties.count)
         }
         let merged = mergeAttributionProperties(properties)
+        let mergedJson = Self.jsonString(from: merged)
         do {
             try core.track(
                 eventName: event,
-                propertiesJson: Self.jsonString(from: merged),
+                propertiesJson: mergedJson,
                 userId: nil,
                 anonymousId: nil
             )
             recordRecentEvent(name: event, propertyCount: merged.count)
+            // Forward every tracked event through the SKAN engine (iOS attribution).
+            // Reuses the already-serialized payload; cheap no-op when SKAN is unconfigured.
+            skan.processEventJson(eventName: event, propertiesJson: mergedJson)
             return .success(())
         } catch {
             let mapped = Self.mapError(error)
@@ -803,6 +807,13 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
                 anonymousId: nil
             )
             recordRecentEvent(name: "screen: \(name)", propertyCount: merged.count)
+            // Forward to SKAN as a `screen_view` (preset rules key off `screen_name`).
+            var skanProps = merged
+            if skanProps["screen_name"] == nil { skanProps["screen_name"] = name }
+            skan.processEventJson(
+                eventName: "screen_view",
+                propertiesJson: Self.jsonString(from: skanProps)
+            )
             return .success(())
         } catch {
             let mapped = Self.mapError(error)
@@ -2312,6 +2323,12 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
                 let responseEtag = httpResponse.value(forHTTPHeaderField: "ETag")
                 do {
                     try core.updateRemoteConfig(configJson: body, etag: responseEtag)
+                    // Re-apply the latest SKAN config to the core engine (preset /
+                    // rules / enabled may have changed) and arm Apple's window if it
+                    // hasn't been armed yet (e.g. the init-time fetch failed/timed
+                    // out). Arming is one-shot, so this never resets the OS value
+                    // mid-session.
+                    self?.skan.configureAndArmFromRemoteConfig()
                     if self?.enableDebug == true {
                         os_log("Remote config updated (ETag: %{public}@)", log: Self.log, type: .debug, responseEtag ?? "nil")
                     }
@@ -2610,34 +2627,15 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
     /// `{ "skan": { "customRules": [...] } }`, the SDK sets the preset or rules
     /// on the SKAN module so consumers don't have to do it manually.
     private func configureSkanFromRemoteConfig(_ remoteConfig: [String: Any]?) {
-        guard let skanConfig = remoteConfig?["skan"] as? [String: Any] else { return }
-
-        // Respect an explicit `enabled: false`
-        if skanConfig["enabled"] as? Bool == false { return }
-
-        if let preset = skanConfig["preset"] as? String {
-            let mapped: SKANModule.Preset
-            switch preset.lowercased() {
-            case "subscriptions": mapped = .subscriptions
-            case "ecommerce":    mapped = .ecommerce
-            case "gaming":       mapped = .gaming
-            case "iap":          mapped = .ecommerce
-            default:             mapped = .custom
-            }
-            skan.setPreset(mapped)
-            skan.registerForAttribution()
-            if enableDebug {
-                os_log("SKAN auto-configured from remote config: preset=%{public}@", log: Self.log, type: .debug, preset)
-            }
-        } else if let rulesJson = skanConfig["customRules"] {
-            if let data = try? JSONSerialization.data(withJSONObject: rulesJson),
-               let rulesStr = String(data: data, encoding: .utf8) {
-                skan.setRules(rulesStr)
-                skan.registerForAttribution()
-                if enableDebug {
-                    os_log("SKAN auto-configured from remote config: custom rules", log: Self.log, type: .debug)
-                }
-            }
+        // Configure the core engine from the cached `skan` block and arm Apple's
+        // postback window exactly once (handled inside the call: it arms only on
+        // the first config that actually enables SKAN, and never re-arms). The
+        // polled config refresh calls the same method, so a first success after a
+        // failed/timed-out init fetch still arms.
+        _ = remoteConfig // arming is driven off the core's cached config, not this snapshot
+        skan.configureAndArmFromRemoteConfig()
+        if enableDebug {
+            os_log("SKAN configured from remote config", log: Self.log, type: .debug)
         }
     }
 
