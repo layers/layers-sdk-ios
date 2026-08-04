@@ -470,7 +470,11 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
             maxBatchSize: nil,
             enableDebug: config.enableDebug,
             debug: config.debug,
-            sdkVersion: nil,
+            // Passing nil made the core emit `rust-core/<v>` with NO platform
+            // token, so events from iOS were indistinguishable from every other
+            // platform on the main /events and /config traffic. See
+            // core/src/client.rs — Some(v) yields "<v> rust-core/<core>".
+            sdkVersion: "swift/\(Self.sdkVersion)",
             persistenceDir: persistencePath,
             // Tier 9 (privacy posture): respectDnt + cookielessMode are
             // web-only; native Swift always passes nil. consentRequired
@@ -2955,12 +2959,21 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
         return formatter.string(from: Date())
     }
 
-    /// Return the SDK version string from the bundle, or a fallback.
+    /// The Swift wrapper's own version, reported as `swift/<version>` in
+    /// `X-SDK-Version`. Kept in lockstep with the rest of the repo by
+    /// scripts/check-versions.sh.
+    static let sdkVersion = "3.2.4"
+
+    /// Return the SDK version string.
+    ///
+    /// WHY THIS IS A CONSTANT (2026-08-04): it used to read
+    /// `CFBundleShortVersionString` from `Bundle(for: Layers.self)`, which is
+    /// not the SDK's version — for a statically linked SDK that bundle is the
+    /// HOST APP, so every consumer reported their own app version as the SDK
+    /// version, and anyone whose bundle lacked the key reported "unknown".
+    /// Either way the ingest SDK-version dimension was unusable for iOS.
     private static func sdkVersionString() -> String {
-        if let version = Bundle(for: Layers.self).infoDictionary?["CFBundleShortVersionString"] as? String {
-            return version
-        }
-        return "unknown"
+        return sdkVersion
     }
 
     private static func persistenceDirectory() -> String {

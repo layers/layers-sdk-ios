@@ -17,6 +17,19 @@ public final class ATTModule: @unchecked Sendable {
 
     private static let log = OSLog(subsystem: "com.layers.sdk", category: "ATTModule")
 
+    /// Info.plist key iOS requires before an app may request tracking consent.
+    /// Absent it, `requestTrackingAuthorization` terminates the process rather
+    /// than returning an error — see the guard in `requestTracking()`.
+    static let trackingUsageDescriptionKey = "NSUserTrackingUsageDescription"
+
+    /// Whether the host app declares the ATT usage description.
+    static var hasTrackingUsageDescription: Bool {
+        let value = Bundle.main.object(
+            forInfoDictionaryKey: trackingUsageDescriptionKey
+        ) as? String
+        return !(value?.isEmpty ?? true)
+    }
+
     // MARK: - Types
 
     public enum Status: String, Sendable {
@@ -79,6 +92,26 @@ public final class ATTModule: @unchecked Sendable {
         if #available(iOS 14.0, *) {
             let current = ATTrackingManager.trackingAuthorizationStatus
             guard current == .notDetermined else {
+                let status = Status(from: current)
+                syncToCore(status: status)
+                return .success(status)
+            }
+
+            // Calling this without NSUserTrackingUsageDescription in the host
+            // app's Info.plist does not fail — iOS terminates the process with
+            // SIGABRT (TCC: "attempted to access privacy-sensitive data
+            // without a usage description"). There is no error to catch and
+            // nothing to recover, so the only defence is not calling it.
+            // An analytics SDK must never be able to crash the app it measures.
+            guard Self.hasTrackingUsageDescription else {
+                NSLog("""
+                    [Layers] ATT request skipped: Info.plist is missing \
+                    NSUserTrackingUsageDescription. iOS terminates any app \
+                    that requests tracking authorization without it, so the \
+                    SDK did not make the request. Add the key with a short \
+                    explanation of how your app uses tracking.
+                    """)
+                // No prompt was shown, so consent genuinely is undetermined.
                 let status = Status(from: current)
                 syncToCore(status: status)
                 return .success(status)
