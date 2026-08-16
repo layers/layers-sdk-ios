@@ -2962,7 +2962,7 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
     /// The Swift wrapper's own version, reported as `swift/<version>` in
     /// `X-SDK-Version`. Kept in lockstep with the rest of the repo by
     /// scripts/check-versions.sh.
-    static let sdkVersion = "3.2.5"
+    static let sdkVersion = "3.2.6"
 
     /// Return the SDK version string.
     ///
