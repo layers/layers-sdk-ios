@@ -28,9 +28,12 @@ public final class DeepLinksModule: @unchecked Sendable {
         }
 
         private static func extractQueryParams(from url: URL) -> [String: String] {
-            guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
-                  let items = components.queryItems else { return [:] }
-            return items.reduce(into: [:]) { $0[$1.name] = $1.value ?? "" }
+            // Deliberately NOT `components.queryItems`: it percent-decodes but
+            // leaves '+' as a literal '+', which disagrees with the
+            // form-urlencoded rule every Layers SDK follows. Ad platforms emit
+            // `utm_campaign=running+shoes` meaning "running shoes".
+            // See FormURLDecoding for the rule.
+            FormURLDecoding.queryParameters(from: url)
         }
     }
 

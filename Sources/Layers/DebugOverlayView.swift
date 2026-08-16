@@ -14,8 +14,16 @@ import UIKit
 /// Layers.showDebugOverlay(in: window)
 /// Layers.hideDebugOverlay()
 /// ```
+///
+/// `@unchecked Sendable`: this view directly owns and mutates a `UIWindow`-attached
+/// UIKit hierarchy (`containerView`, labels, `refreshTimer`), which by UIKit's own
+/// contract must happen on the main thread — `showDebugOverlay(in:)`/
+/// `hideDebugOverlay()` are documented main-thread APIs, same as any other UIKit
+/// caller. The conformance only exists so `self` can be captured in the `@Sendable`
+/// closures `Timer(timeInterval:repeats:)` and `DispatchQueue.main.asyncAfter`
+/// require; it does not license calling this class off the main thread.
 @available(iOS 14.0, tvOS 14.0, *)
-internal final class DebugOverlayView: NSObject {
+internal final class DebugOverlayView: NSObject, @unchecked Sendable {
 
     // MARK: - Constants
 

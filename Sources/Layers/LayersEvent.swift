@@ -60,13 +60,16 @@ public enum StandardEvent: String, LayersEvent, Sendable {
 // MARK: - Parameterized Standard Events
 
 /// Parameterized event wrapper that carries properties alongside a standard event name.
-public struct ParameterizedEvent: LayersEvent, Sendable {
+public struct ParameterizedEvent: LayersEvent, @unchecked Sendable {
     public let eventName: String
     public let properties: [String: Any]
 
-    // Sendable conformance: [String: Any] is not automatically Sendable, but we only store
-    // JSON-serializable primitives (String, NSNumber, Bool) which are all Sendable values.
-    // This is safe for cross-isolation use.
+    // [String: Any] is not automatically Sendable — `Any` can't be checked by the
+    // compiler — so this needs `@unchecked` (a plain `Sendable` conformance here
+    // does not compile-time-verify and was silently unchecked-by-comment only; the
+    // keyword now says what the comment already claimed). We only ever store
+    // JSON-serializable primitives (String, NSNumber, Bool) which are all
+    // genuinely Sendable values, making this safe for cross-isolation use.
 
     init(eventName: String, properties: [String: Any]) {
         self.eventName = eventName

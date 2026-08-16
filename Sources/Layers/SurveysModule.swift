@@ -25,8 +25,17 @@ import UIKit
 #if canImport(UIKit)
 
 /// Public surveys API exposed via `Layers.shared.surveys`.
+///
+/// `@unchecked Sendable`: this module drives `UIViewController` presentation
+/// (`actuallyPresent`/`SurveyViewController`), so by contract every call into it
+/// happens on the main thread — the same contract UIKit itself imposes on view
+/// controller work. Its mutable state (`lastActives`, `presentingSurveyId`,
+/// `pendingTimer`) is only ever touched from that single-threaded context. The
+/// conformance exists so `self` can be captured in the `@Sendable` closure
+/// `Timer.scheduledTimer(withTimeInterval:repeats:block:)` requires in `show(_:)`;
+/// it does not add any new capability to call this class concurrently.
 @available(iOS 14.0, tvOS 14.0, macCatalyst 14.0, *)
-public final class SurveysModule {
+public final class SurveysModule: @unchecked Sendable {
     private let coreProvider: () -> LayersCoreHandle?
 
     // Decoded survey-definition cache. We rebuild this every time
@@ -172,7 +181,12 @@ public final class SurveysModule {
 // can drive UIKit without parsing JSON for every field. The Rust side owns
 // the canonical definitions; these structs are decode-only.
 
-public struct SurveyDefinitionDecoded: Decodable {
+// All three structs below are plain decoded data — every stored property is a
+// String/Bool/Int or another Sendable-conforming struct here, so they're trivially
+// safe to share across threads. Public types don't get *implicit* Sendable
+// synthesis though, so each needs the explicit conformance (they cross a
+// `@Sendable` closure boundary in `show(_:)`'s `Timer.scheduledTimer` callback).
+public struct SurveyDefinitionDecoded: Decodable, Sendable {
     public let id: String
     public let name: String
     public let type: String
@@ -181,7 +195,7 @@ public struct SurveyDefinitionDecoded: Decodable {
     public let display: SurveyDisplayDecoded?
 }
 
-public struct SurveyQuestionDecoded: Decodable {
+public struct SurveyQuestionDecoded: Decodable, Sendable {
     public let id: String
     public let text: String
     public let type: String
@@ -193,7 +207,7 @@ public struct SurveyQuestionDecoded: Decodable {
     public let link_label: String?
 }
 
-public struct SurveyDisplayDecoded: Decodable {
+public struct SurveyDisplayDecoded: Decodable, Sendable {
     public let delay_ms: Int?
     public let position: String?
     public let dismissable: Bool?
