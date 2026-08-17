@@ -2720,8 +2720,14 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
             props["adservices_token"] = token
         }
 
-        if clipboardAttributionEnabled, let clipboardUrl = clipboard.checkClipboard() {
-            props["clipboard_attribution_url"] = clipboardUrl
+        // Clipboard attribution — gated behind remote config. Reports both the
+        // URL and the click ID extracted from it (the same two keys Kotlin,
+        // Flutter, Unity, and React Native send), plus read-attempt telemetry
+        // on every launch so the clipboard read rate has a denominator: without
+        // it a launch that never touched the pasteboard is indistinguishable
+        // from one that read it and found nothing.
+        for (key, value) in clipboard.attributionProperties(enabled: clipboardAttributionEnabled) {
+            props[key] = value
         }
 
         // First launch with no prior attribution signal: ask the server to
@@ -2839,6 +2845,40 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
     /// Default ingest API base URL.
     private static let defaultBaseUrl = "https://in.layers.com"
 
+    /// Build the `POST /users/properties` request body.
+    ///
+    /// Split out from `sendUserPropertiesAsync` so the wire contract can be
+    /// asserted directly against `schema/user-properties.schema.json` — the
+    /// send itself goes through `URLSession.shared` and is not interceptable
+    /// from a unit test.
+    static func buildUserPropertiesPayload(
+        appId: String,
+        appUserId: String,
+        properties: [String: Any],
+        timestamp: String,
+        setOnce: Bool,
+        deviceId: String?
+    ) -> [String: Any] {
+        var payload: [String: Any] = [
+            "app_id": appId,
+            "app_user_id": appUserId,
+            "properties": properties,
+            "timestamp": timestamp
+        ]
+        // The core's device_id — the same value already attached to every
+        // event. The server joins the (device_id, user_id) pair to stitch
+        // anonymous activity onto the identified profile, so omitting it here
+        // left every /users/properties upsert unstitchable. Empty is treated
+        // as absent: the schema declares minLength 1.
+        if let deviceId = deviceId, !deviceId.isEmpty {
+            payload["device_id"] = deviceId
+        }
+        if setOnce {
+            payload["set_once"] = true
+        }
+        return payload
+    }
+
     /// Fire-and-forget POST to /users/properties.
     /// Best-effort: errors are silently swallowed.
     private func sendUserPropertiesAsync(_ properties: [String: Any], setOnce: Bool) {
@@ -2847,6 +2887,10 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
         let userId = _appUserId
         let anonId = _anonymousId
         let baseUrlConfig = _configBaseUrl
+        // Capture the core handle here rather than reading `self.deviceId`
+        // below: `lock` is a non-recursive NSLock and `deviceId` re-acquires
+        // it, so touching it inside this critical section would deadlock.
+        let coreHandle = _isInitialized ? _core : nil
         lock.unlock()
 
         guard let appId = appId else { return }
@@ -2855,15 +2899,14 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
         let baseUrl = (baseUrlConfig ?? Self.defaultBaseUrl)
             .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
 
-        var payload: [String: Any] = [
-            "app_id": appId,
-            "app_user_id": appUserId,
-            "properties": properties,
-            "timestamp": Self.iso8601Timestamp()
-        ]
-        if setOnce {
-            payload["set_once"] = true
-        }
+        let payload = Self.buildUserPropertiesPayload(
+            appId: appId,
+            appUserId: appUserId,
+            properties: properties,
+            timestamp: Self.iso8601Timestamp(),
+            setOnce: setOnce,
+            deviceId: coreHandle?.getDeviceId()
+        )
 
         guard let bodyData = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]) else {
             return
@@ -2876,7 +2919,7 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
         request.httpBody = bodyData
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue(appId, forHTTPHeaderField: "X-App-Id")
-        request.setValue("swift/\(Self.sdkVersionString())", forHTTPHeaderField: "X-SDK-Version")
+        request.setValue(Self.sdkVersionHeader(), forHTTPHeaderField: "X-SDK-Version")
         request.timeoutInterval = 10
 
         // Fire-and-forget on a background queue
@@ -2937,7 +2980,7 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
         request.httpBody = bodyData
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue(appId, forHTTPHeaderField: "X-App-Id")
-        request.setValue("swift/\(Self.sdkVersionString())", forHTTPHeaderField: "X-SDK-Version")
+        request.setValue(Self.sdkVersionHeader(), forHTTPHeaderField: "X-SDK-Version")
         request.timeoutInterval = timeout
 
         // Block the caller briefly (up to `timeout`) with a semaphore so the
@@ -3016,7 +3059,7 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
     /// The Swift wrapper's own version, reported as `swift/<version>` in
     /// `X-SDK-Version`. Kept in lockstep with the rest of the repo by
     /// scripts/check-versions.sh.
-    static let sdkVersion = "3.2.8"
+    static let sdkVersion = "3.2.9"
 
     /// Return the SDK version string.
     ///
@@ -3028,6 +3071,18 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
     /// Either way the ingest SDK-version dimension was unusable for iOS.
     private static func sdkVersionString() -> String {
         return sdkVersion
+    }
+
+    /// The `X-SDK-Version` value for requests this wrapper builds itself
+    /// (`/users/properties`, `/clicks/resolve`) rather than taking from the
+    /// core's `flushHeaders()`.
+    ///
+    /// The trailing `engine/rust` matches what the core stamps on `/events`
+    /// and `/config` (`ENGINE_TOKEN` in core/src/client.rs), so one install
+    /// reports one shape on every endpoint. iOS always runs the native Rust
+    /// core, so the token is constant here.
+    static func sdkVersionHeader() -> String {
+        return "swift/\(sdkVersionString()) engine/rust"
     }
 
     private static func persistenceDirectory() -> String {
