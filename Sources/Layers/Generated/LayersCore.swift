@@ -963,6 +963,16 @@ public protocol LayersCoreHandleProtocol: AnyObject {
     func shouldAttemptFlush() -> Bool
 
     /**
+     * Delivery gate for a wrapper-built request that carries NO event batch
+     * (e.g. `POST /clicks/resolve`). Reads the same privacy, Retry-After and
+     * circuit-breaker state as `should_attempt_flush`, with none of its side
+     * effects: it never claims the breaker's half-open probe, so the caller
+     * owes no `record_flush_result` and must NOT call `abort_flush_attempt`
+     * (which would clear a concurrent batch's `$first_open` claim).
+     */
+    func shouldAttemptSideRequest() -> Bool
+
+    /**
      * Gracefully shut down: persist remaining events, stop processing.
      */
     func shutdown() throws
@@ -1843,6 +1853,20 @@ open class LayersCoreHandle:
     open func shouldAttemptFlush() -> Bool {
         return try! FfiConverterBool.lift(try! rustCall {
             uniffi_layers_core_fn_method_layerscorehandle_should_attempt_flush(self.uniffiClonePointer(), $0)
+        })
+    }
+
+    /**
+     * Delivery gate for a wrapper-built request that carries NO event batch
+     * (e.g. `POST /clicks/resolve`). Reads the same privacy, Retry-After and
+     * circuit-breaker state as `should_attempt_flush`, with none of its side
+     * effects: it never claims the breaker's half-open probe, so the caller
+     * owes no `record_flush_result` and must NOT call `abort_flush_attempt`
+     * (which would clear a concurrent batch's `$first_open` claim).
+     */
+    open func shouldAttemptSideRequest() -> Bool {
+        return try! FfiConverterBool.lift(try! rustCall {
+            uniffi_layers_core_fn_method_layerscorehandle_should_attempt_side_request(self.uniffiClonePointer(), $0)
         })
     }
 
@@ -3560,6 +3584,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if uniffi_layers_core_checksum_method_layerscorehandle_should_attempt_flush() != 29198 {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if uniffi_layers_core_checksum_method_layerscorehandle_should_attempt_side_request() != 16445 {
         return InitializationResult.apiChecksumMismatch
     }
     if uniffi_layers_core_checksum_method_layerscorehandle_shutdown() != 44265 {

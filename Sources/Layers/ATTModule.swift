@@ -57,6 +57,14 @@ public final class ATTModule: @unchecked Sendable {
 
     private let lock = NSLock()
     private var _core: LayersCoreHandle?
+    /// Mirrors ``LayersConfig/attDrivesAdvertisingConsent``.
+    private var _drivesAdvertisingConsent = true
+    /// Set once the host app sets any ad category itself — from then on the
+    /// app owns them and ATT stops writing them.
+    private var _appOwnsAdConsent = false
+    /// Owns `_lastDeviceContext`, which ATT updates must be layered onto —
+    /// `setDeviceContext` replaces the core's context wholesale.
+    private weak var _sdk: Layers?
 
     private var lockedCore: LayersCoreHandle? {
         lock.lock()
@@ -64,11 +72,30 @@ public final class ATTModule: @unchecked Sendable {
         return _core
     }
 
+    private var lockedSdk: Layers? {
+        lock.lock()
+        defer { lock.unlock() }
+        return _sdk
+    }
+
     init() {}
 
-    func attach(core: LayersCoreHandle) {
+    func attach(core: LayersCoreHandle, sdk: Layers, drivesAdvertisingConsent: Bool) {
         lock.lock()
         _core = core
+        _sdk = sdk
+        _drivesAdvertisingConsent = drivesAdvertisingConsent
+        // A fresh `initialize` starts a fresh consent conversation.
+        _appOwnsAdConsent = false
+        lock.unlock()
+    }
+
+    /// Record that the host app set an ad-consent category explicitly.
+    /// Called by ``Layers/setConsent(_:)``; after this, ATT answers no longer
+    /// touch `ad_storage` / `ad_user_data` / `ad_personalization`.
+    func appDidSetAdvertisingConsent() {
+        lock.lock()
+        _appOwnsAdConsent = true
         lock.unlock()
     }
 
@@ -170,30 +197,94 @@ public final class ATTModule: @unchecked Sendable {
 
     // MARK: - Internal
 
-    /// Push current ATT state into the Rust core via setDeviceContext.
+    /// Push current ATT state into the Rust core.
+    ///
+    /// Delegates to ``Layers/applyATTDeviceContext(idfa:idfv:attStatus:core:)``
+    /// because the update is PARTIAL: `setDeviceContext` replaces the core's
+    /// context wholesale, and only `Layers` holds the last full context to
+    /// layer these three fields onto.
     func syncToCore(status: Status? = nil) {
-        guard let core = lockedCore else { return }
+        guard let core = lockedCore, let sdk = lockedSdk else { return }
         let currentStatus = status ?? getStatus()
-        let context = UniFfiDeviceContext(
-            platform: nil,
-            osVersion: nil,
-            appVersion: nil,
-            deviceModel: nil,
-            locale: nil,
-            buildNumber: nil,
-            screenSize: nil,
-            installId: nil,
+        sdk.applyATTDeviceContext(
             idfa: getAdvertisingId(),
             idfv: getVendorId(),
             attStatus: currentStatus.rawValue,
-            deeplinkId: nil,
-            gclid: nil,
-            timezone: nil
+            core: core
         )
+
+        mirrorToAdvertisingConsent(status: currentStatus, core: core)
+    }
+
+    // MARK: - ATT → advertising consent
+
+    /// The Consent Mode v2 ad-category verdict an ATT answer implies.
+    ///
+    /// `nil` means "no verdict": the user has not answered the prompt, so
+    /// consent must be left exactly as it is rather than manufacturing a
+    /// decision nobody made.
+    static func advertisingConsent(forATT status: Status) -> Bool? {
+        switch status {
+        case .authorized:
+            return true
+        // `.restricted` is an OS-level block (parental controls / MDM) — the
+        // user cannot grant tracking, which is a denial, not an absence.
+        case .denied, .restricted:
+            return false
+        case .notDetermined, .unknown:
+            return nil
+        }
+    }
+
+    /// Write an ATT-derived verdict into the core's three ad categories,
+    /// leaving the analytics categories exactly as they were.
+    ///
+    /// The analytics carry-through is load-bearing: `set_consent` REPLACES the
+    /// whole consent state in the core (`core/src/consent.rs`
+    /// `ConsentManager::set` — `*state = next`), so an ad-only update that
+    /// omitted `analytics_storage` would silently revoke an explicit analytics
+    /// grant and, under `consentRequired: true`, close the flush gate.
+    static func applyAdvertisingConsent(_ granted: Bool, to core: LayersCoreHandle) throws {
+        let current = try? core.getConsentState()
+        try core.setConsent(consent: UniFfiConsent(
+            analyticsStorage: current?.analyticsStorage,
+            adStorage: granted,
+            adUserData: granted,
+            adPersonalization: granted,
+            analytics: current?.analytics,
+            advertising: nil
+        ))
+    }
+
+    /// Mirror an ATT answer into ad consent, unless the app opted out or has
+    /// taken ownership of the ad categories itself.
+    ///
+    /// Apple's ATT prompt IS the user's advertising-tracking decision on iOS,
+    /// and without this the IDFA collected in `syncToCore` never leaves the
+    /// device: the core copies `idfa` / `att_status` onto an event only while
+    /// `ad_storage` is granted (`core/src/client.rs` `build_event`), and
+    /// `ad_storage` reads as DENIED while unset (`core/src/consent.rs`
+    /// `advertising_allowed` — `unwrap_or(false)`). React Native, Expo, Unity
+    /// and Flutter all already mirror ATT this way; Swift did not, so an
+    /// ATT-authorized user's IDFA was discarded on every single event unless
+    /// the host app knew to call `setConsent` itself.
+    private func mirrorToAdvertisingConsent(status: Status, core: LayersCoreHandle) {
+        lock.lock()
+        let enabled = _drivesAdvertisingConsent
+        let appOwns = _appOwnsAdConsent
+        lock.unlock()
+
+        // The host app's own decision wins in both directions.
+        guard enabled, !appOwns else { return }
+        guard let granted = Self.advertisingConsent(forATT: status) else { return }
+
         do {
-            try core.setDeviceContext(context: context)
+            try Self.applyAdvertisingConsent(granted, to: core)
         } catch {
-            os_log("setDeviceContext failed: %{public}@", log: Self.log, type: .error, error.localizedDescription)
+            os_log(
+                "ATT consent mirror failed: %{public}@",
+                log: Self.log, type: .error, error.localizedDescription
+            )
         }
     }
 }

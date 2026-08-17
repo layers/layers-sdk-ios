@@ -256,12 +256,30 @@ public final class SKANModule: @unchecked Sendable {
     }
 
     #if os(iOS) && canImport(StoreKit)
+    /// Map a core-supplied coarse value onto Apple's enum.
+    ///
+    /// `.low` remains the fallback — it is Apple's most conservative bucket and
+    /// the long-standing behaviour — but an unrecognised string is now logged
+    /// instead of being indistinguishable from a genuine `"low"`. That mattered
+    /// little while the core sent `nil` for every preset rule and this function
+    /// was only reached for explicitly-configured values; now that the core
+    /// derives a coarse value for every match, this is on the path of every
+    /// SKAN-configured install, and a server-side typo in `coarseValue` would
+    /// otherwise silently post every install as low-value.
     @available(iOS 16.1, *)
     private func mapCoarseValue(_ value: String) -> SKAdNetwork.CoarseConversionValue {
-        switch value.lowercased() {
+        switch value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
         case "high":   return .high
         case "medium": return .medium
-        default:       return .low
+        case "low":    return .low
+        default:
+            os_log(
+                "unknown SKAN coarse value %{public}@ — posting 'low'",
+                log: Self.log,
+                type: .error,
+                value
+            )
+            return .low
         }
     }
     #endif

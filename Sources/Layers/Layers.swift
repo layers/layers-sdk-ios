@@ -167,6 +167,23 @@ public struct LayersConfig: Sendable {
     /// explicitly waits for affirmative user action.
     public let consentRequired: Bool
 
+    /// Whether an App Tracking Transparency answer sets advertising consent.
+    /// Defaults to `true`.
+    ///
+    /// On iOS the ATT prompt *is* the user's advertising-tracking decision, so
+    /// `.authorized` grants the three Consent Mode v2 ad categories
+    /// (`adStorage`, `adUserData`, `adPersonalization`) and
+    /// `.denied` / `.restricted` deny them. Without this the IDFA the SDK
+    /// collects after an ATT grant never reaches the wire — the core strips
+    /// `idfa` and `att_status` from every event while `adStorage` is denied,
+    /// and it is denied until something grants it.
+    ///
+    /// Set to `false` if a consent management platform owns the ad categories.
+    /// Note that calling ``Layers/setConsent(_:)`` with any ad category set
+    /// also hands ownership to the app permanently — from that point ATT
+    /// answers no longer touch consent, whatever this flag says.
+    public let attDrivesAdvertisingConsent: Bool
+
     public init(
         appId: String,
         environment: LayersEnvironment = .production,
@@ -181,6 +198,7 @@ public struct LayersConfig: Sendable {
         automaticScreenTrackingEnabled: Bool = true,
         automaticPurchaseTrackingEnabled: Bool = false,
         consentRequired: Bool = false,
+        attDrivesAdvertisingConsent: Bool = true,
         featureFlagBootstrap: BootstrapData? = nil
     ) {
         self.appId = appId
@@ -196,6 +214,7 @@ public struct LayersConfig: Sendable {
         self.automaticScreenTrackingEnabled = automaticScreenTrackingEnabled
         self.automaticPurchaseTrackingEnabled = automaticPurchaseTrackingEnabled
         self.consentRequired = consentRequired
+        self.attDrivesAdvertisingConsent = attDrivesAdvertisingConsent
         self.featureFlagBootstrap = featureFlagBootstrap
     }
 }
@@ -577,7 +596,11 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
         }
 
         skan.attach(core: handle)
-        att.attach(core: handle)
+        att.attach(
+            core: handle,
+            sdk: self,
+            drivesAdvertisingConsent: config.attDrivesAdvertisingConsent
+        )
         deepLinks.attach(core: handle)
         commerce.attach(core: handle, skan: skan)
         superwall.attach(sdk: self)
@@ -711,17 +734,28 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
                 }
             }
 
-            // Read remote config and apply server-driven settings
+            // Read remote config and apply server-driven settings.
+            //
+            // Every switch here defaults to false and treats "no config" as
+            // false. `getRemoteConfigJson()` returns nil until a fetch has
+            // succeeded, so a launch whose fetch failed or timed out (the 2s
+            // cap above) leaves them all off rather than guessing — which is
+            // the whole point for `fingerprintResolveEnabled` below.
             let clipboardEnabled: Bool
+            let fingerprintResolveEnabled: Bool
             let remoteConfigDict: [String: Any]?
             if let configJson = try? core.getRemoteConfigJson(),
                let data = configJson.data(using: .utf8),
                let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
                 remoteConfigDict = parsed
                 clipboardEnabled = parsed["clipboard_attribution_enabled"] as? Bool ?? false
+                // `as? Bool` on purpose: a truthy non-boolean ("true", 1)
+                // casts to nil and leaves the gate shut.
+                fingerprintResolveEnabled = parsed["fingerprint_resolve_enabled"] as? Bool ?? false
             } else {
                 remoteConfigDict = nil
                 clipboardEnabled = false
+                fingerprintResolveEnabled = false
             }
 
             // Auto-configure SKAN from remote config (iOS only).
@@ -745,6 +779,7 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
                 self.trackAttributionSignals(
                     core: core,
                     clipboardAttributionEnabled: clipboardEnabled,
+                    fingerprintResolveEnabled: fingerprintResolveEnabled,
                     autoTrackAppOpen: config.autoTrackAppOpen
                 )
             }
@@ -1681,12 +1716,20 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
     ///
     /// On a Denied → Granted transition for `analyticsStorage`, the Rust core
     /// auto-drains queued events.
+    ///
+    /// Setting any ad category (`adStorage`, `adUserData`, `adPersonalization`)
+    /// hands ownership of all three to the app: App Tracking Transparency
+    /// answers stop writing them, so an explicit grant is never downgraded by a
+    /// later ATT denial. See ``LayersConfig/attDrivesAdvertisingConsent``.
     @discardableResult
     public func setConsent(_ consent: ConsentSettings) -> SafeResult<Void> {
         guard let core = lockedCoreIfInitialized() else {
             let err = LayersError.notInitialized
             reportError(method: "setConsent", error: err)
             return .failure(err)
+        }
+        if consent.adStorage != nil || consent.adUserData != nil || consent.adPersonalization != nil {
+            att.appDidSetAdvertisingConsent()
         }
         if enableDebug {
             os_log(
@@ -2505,6 +2548,70 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
         return _enableDebug
     }
 
+    /// The live core handle, for tests that must assert on the serialized
+    /// batch the wrapper would POST. `internal`, so it is invisible outside
+    /// the module. The device context has no getter on the core, so drained
+    /// events are the only place its contents can be observed.
+    var coreHandleForTests: LayersCoreHandle? { lockedCoreIfInitialized() }
+
+    /// Merge ATT-derived identifiers into the cached device context and push
+    /// the merged result to the core.
+    ///
+    /// `setDeviceContext` REPLACES the core's context wholesale
+    /// (`core/src/client.rs` `set_device_context`: `*self.device_context.write() = context`),
+    /// so a partial update MUST be layered on the last full context. `ATTModule`
+    /// used to send a fresh record that was `nil` everywhere except the three
+    /// ATT fields, which blanked `os_version` / `app_version` / `device_model` /
+    /// `locale` (to the core's "unknown" / "en_US" sentinels) and dropped
+    /// `install_id` / `build_number` / `screen_size` / `timezone` /
+    /// `deeplink_id` / `gclid` on every event thereafter.
+    ///
+    /// The `core` handle is passed in rather than read from `_core` because
+    /// `initialize` calls this (via `att.syncToCore()`) while the handle is
+    /// still local — `_core` is not assigned until a few lines later.
+    ///
+    /// Mirrors the partial-update shape already used by `setAttributionData`
+    /// and `restoreAttributionData`.
+    func applyATTDeviceContext(
+        idfa: String?,
+        idfv: String?,
+        attStatus: String,
+        core: LayersCoreHandle
+    ) {
+        lock.lock()
+        let base = _lastDeviceContext
+        lock.unlock()
+
+        let updatedCtx = UniFfiDeviceContext(
+            platform: base?.platform,
+            osVersion: base?.osVersion,
+            appVersion: base?.appVersion,
+            deviceModel: base?.deviceModel,
+            locale: base?.locale,
+            buildNumber: base?.buildNumber,
+            screenSize: base?.screenSize,
+            installId: base?.installId,
+            idfa: idfa,
+            idfv: idfv,
+            attStatus: attStatus,
+            deeplinkId: base?.deeplinkId,
+            gclid: base?.gclid,
+            timezone: base?.timezone
+        )
+
+        do {
+            try core.setDeviceContext(context: updatedCtx)
+            lock.lock()
+            _lastDeviceContext = updatedCtx
+            lock.unlock()
+        } catch {
+            os_log(
+                "ATT setDeviceContext failed: %{public}@",
+                log: Self.log, type: .error, error.localizedDescription
+            )
+        }
+    }
+
     /// Thread-safe accessor: returns the core handle if initialized, nil otherwise.
     private func lockedCoreIfInitialized() -> LayersCoreHandle? {
         lock.lock()
@@ -2697,10 +2804,28 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
         }
     }
 
+    /// Whether the first-launch device-fingerprint probe may run.
+    ///
+    /// Pure and static so the whole policy is one testable expression rather
+    /// than a condition buried in an async init chain. The delivery half of
+    /// the gate (consent / DNT / Retry-After / breaker) is applied separately
+    /// in ``resolveClickFromFingerprintBlocking(timeout:enabled:)``, which has
+    /// the core handle.
+    ///
+    /// `remoteConfigEnabled` is false whenever the server has not said `true`
+    /// — including when no config has been fetched at all. Unknown is off.
+    static func fingerprintResolveAllowed(
+        remoteConfigEnabled: Bool,
+        isFirstLaunch: Bool,
+        hasExistingAttribution: Bool
+    ) -> Bool {
+        remoteConfigEnabled && isFirstLaunch && !hasExistingAttribution
+    }
+
     /// Collect AdServices token, clipboard URL, timezone, and first-launch flag,
     /// then fire an `app_open` event with attribution signals as properties
     /// (unless `autoTrackAppOpen` is false).
-    private func trackAttributionSignals(core: LayersCoreHandle, clipboardAttributionEnabled: Bool, autoTrackAppOpen: Bool) {
+    private func trackAttributionSignals(core: LayersCoreHandle, clipboardAttributionEnabled: Bool, fingerprintResolveEnabled: Bool, autoTrackAppOpen: Bool) {
         guard autoTrackAppOpen else { return }
 
         var props: [String: Any] = [
@@ -2738,21 +2863,34 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
         // app_install / app_open from that background queue AFTER the resolve
         // completes (or times out) so the CAPI events carry the recovered
         // click IDs on first launch, which is the entire point of this path.
-        let needsResolve: Bool = {
-            if !isFirstLaunch { return false }
+        //
+        // GATED, DEFAULT OFF (`fingerprint_resolve_enabled`). The probe sends
+        // device model, OS version, locale, timezone and screen size for the
+        // server to match against recent clicks — device fingerprinting under
+        // App Store Review Guideline 5.1.2 regardless of ATT status. It runs
+        // only on a launch where the config fetch above landed AND said `true`;
+        // a first launch with no reachable config forfeits it for good, since
+        // `isFirstLaunch` is false by the next launch. Losing an attribution
+        // match beats fingerprinting an install the server never asked us to.
+        let hasExistingAttribution: Bool = {
             lock.lock()
             defer { lock.unlock() }
-            return _attributionFbclid == nil
-                && _attributionGclid == nil
-                && _attributionTtclid == nil
-                && _attributionMsclkid == nil
+            return _attributionFbclid != nil
+                || _attributionGclid != nil
+                || _attributionTtclid != nil
+                || _attributionMsclkid != nil
         }()
+        let needsResolve = Self.fingerprintResolveAllowed(
+            remoteConfigEnabled: fingerprintResolveEnabled,
+            isFirstLaunch: isFirstLaunch,
+            hasExistingAttribution: hasExistingAttribution
+        )
 
         if needsResolve {
             let baseProps = SendableJSONProps(value: props)
             DispatchQueue.global(qos: .utility).async { [weak self] in
                 guard let self = self else { return }
-                self.resolveClickFromFingerprintBlocking(timeout: 3.0)
+                self.resolveClickFromFingerprintBlocking(timeout: 3.0, enabled: fingerprintResolveEnabled)
                 self.emitAttributionTrackEvents(core: core, baseProps: baseProps.value, isFirstLaunch: true)
             }
             return
@@ -2943,7 +3081,37 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
     /// this exact event — subsequent events will still carry it when the
     /// URLSession response eventually lands and calls setAttributionData
     /// (we keep a background completion handler for that path).
-    private func resolveClickFromFingerprintBlocking(timeout: TimeInterval) {
+    ///
+    /// Two gates, both required. `enabled` is the `fingerprint_resolve_enabled`
+    /// remote-config switch (default OFF, and OFF whenever no config has been
+    /// fetched); `shouldAttemptSideRequest()` is the core's delivery policy for
+    /// a request carrying no event batch, so a
+    /// device that denied analytics consent, is sending DNT, is inside a server
+    /// Retry-After window, or is behind an open circuit breaker sends no
+    /// fingerprint. Both checks live here, not only at the call site, so a
+    /// future caller inherits them.
+    private func resolveClickFromFingerprintBlocking(timeout: TimeInterval, enabled: Bool) {
+        guard enabled else { return }
+
+        // The same policy an event batch answers to (ADR 0001) — consent, DNT,
+        // Retry-After, circuit breaker — read WITHOUT the flush gate's side
+        // effects. Nothing about a fingerprint probe deserves to outrank a
+        // consent denial, and nothing about it justifies spending the breaker's
+        // half-open probe or clearing a concurrent batch's `$first_open`
+        // delivery claim, which is what `shouldAttemptFlush()` followed by
+        // `abortFlushAttempt()` would do.
+        guard let gateCore = lockedCoreIfInitialized(),
+              gateCore.shouldAttemptSideRequest() else {
+            if enableDebug {
+                os_log(
+                    "clicks/resolve skipped — core delivery gate closed",
+                    log: Self.log,
+                    type: .debug
+                )
+            }
+            return
+        }
+
         lock.lock()
         let appId = _configAppId
         let baseUrlConfig = _configBaseUrl
@@ -3059,7 +3227,7 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
     /// The Swift wrapper's own version, reported as `swift/<version>` in
     /// `X-SDK-Version`. Kept in lockstep with the rest of the repo by
     /// scripts/check-versions.sh.
-    static let sdkVersion = "3.2.10"
+    static let sdkVersion = "3.2.11"
 
     /// Return the SDK version string.
     ///
