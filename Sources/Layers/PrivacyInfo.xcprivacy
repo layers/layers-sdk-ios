@@ -6,20 +6,55 @@
       Layers Swift SDK Privacy Manifest
 
       Audited 2026-05-01 (Tier 9 privacy posture work).
+      Re-audited 2026-06-10 (audit M3): added PurchaseHistory.
+      Re-audited 2026-08-28 against the code as shipped in 3.2.13, after a
+      customer's pre-submission audit found the declarations below did not
+      match what the SDK does. Every entry is now tied to the code that
+      produces it — keep it that way.
 
-      The Rust core that backs this SDK touches a small number of Apple
-      "required reason" APIs. Each entry below documents what we use and
-      why. Apple validates this file against actual API usage at App
-      Store submission — keep it in sync with what the Rust core / Swift
-      wrapper actually does.
+      WHAT THIS SDK DOES WITH THE DATA (so the app can declare honestly):
 
-      Re-audited 2026-06-10 (audit M3): added PurchaseHistory, which the
-      CommerceModule has collected since the StoreKit integration landed.
+      Every event carries a persistent per-install `device_id`,
+      `anonymous_id`, `install_id`, the IDFV, and — once App Tracking
+      Transparency has been authorized — the IDFA (core/src/client.rs,
+      `build_event`). After `identify(userId:)` every event also carries the
+      app's user id. When the host app connects an ad-network Conversions
+      API in Layers (Meta, TikTok, OpenAI, LinkedIn), the Layers server
+      forwards conversion events with those identifiers — the IDFA as
+      Meta's `madid`, the install id as `anon_id`, the user id hashed as
+      `external_id` — so the ad network can attribute the conversion to a
+      campaign. Under Apple's definition that is tracking, and the data
+      types below are LINKED to a persistent device identity and, after
+      identify(), to the user.
 
-      NSPrivacyTracking is false today: the SDK does not send data to an
-      ATT-defined tracking endpoint. Flipping it to true (with a dedicated
-      tracking domain, e.g. tr.layers.com, in NSPrivacyTrackingDomains) is
-      a pending product decision blocked on infra — see the audit record.
+      THE HOST APP MUST ANSWER "YES" TO "DO YOU OR YOUR THIRD-PARTY PARTNERS
+      USE DATA FOR TRACKING?" IN APP STORE CONNECT WHEN AD-NETWORK
+      FORWARDING IS ENABLED, and declare Device ID, Product Interaction,
+      Purchase History, User ID and Advertising Data as linked to the user
+      and used for tracking. https://layers.com/docs/sdk/app-store-privacy
+      carries the copy-paste table.
+
+      WHY NSPrivacyTracking IS STILL false HERE: Apple requires at least one
+      domain in NSPrivacyTrackingDomains when NSPrivacyTracking is true, and
+      iOS then fails every request to those domains for any user who has
+      not granted ATT. This SDK has ONE host, in.layers.com, which carries
+      first-party analytics and the ad-forwarded events alike, so listing
+      it would silently drop ALL delivery for every non-authorized user.
+      The honest flag needs a dedicated tracking host (tr.layers.com) that
+      receives only the ad-forwarded traffic; that split is scheduled, and
+      this flag flips with it. Until then the per-type Tracking flags stay
+      in step with NSPrivacyTracking, and the obligation above is the app's.
+
+      NOT collected by this SDK, and deliberately absent below:
+      - Crash data: ExceptionModule.swift exists in this package but nothing
+        in Layers.swift instantiates it. No handler is installed; no
+        `$exception` event is ever emitted by the Swift wrapper.
+      - Performance data: MetricKitModule.swift likewise is never
+        constructed; no MXMetricManager subscription exists.
+      - Precise or coarse location: the SDK reads no location API. (The
+        Layers server resolves the connection IP to a coarse region for ad
+        matching; that is a server-side derivation the app may need to
+        declare — see the docs page above.)
     -->
 
     <key>NSPrivacyTracking</key>
@@ -27,74 +62,84 @@
     <key>NSPrivacyTrackingDomains</key>
     <array/>
 
-    <!--
-      Data types collected by the SDK. Both are device-scoped /
-      product-interaction telemetry — never linked to identity (the host
-      app may layer that on, but the SDK alone does not).
-    -->
     <key>NSPrivacyCollectedDataTypes</key>
     <array>
+        <!-- device_id (persistent per-install UUID), anonymous_id,
+             install_id, IDFV always; IDFA after ATT authorization
+             (ATTModule.swift → core build_event). -->
         <dict>
             <key>NSPrivacyCollectedDataType</key>
             <string>NSPrivacyCollectedDataTypeDeviceID</string>
             <key>NSPrivacyCollectedDataTypeLinked</key>
-            <false/>
+            <true/>
             <key>NSPrivacyCollectedDataTypeTracking</key>
             <false/>
             <key>NSPrivacyCollectedDataTypePurposes</key>
             <array>
                 <string>NSPrivacyCollectedDataTypePurposeAnalytics</string>
+                <string>NSPrivacyCollectedDataTypePurposeThirdPartyAdvertising</string>
+                <string>NSPrivacyCollectedDataTypePurposeDeveloperAdvertising</string>
             </array>
         </dict>
+        <!-- app_user_id / user_id after identify(userId:), stamped on every
+             subsequent event and forwarded hashed as external_id. -->
+        <dict>
+            <key>NSPrivacyCollectedDataType</key>
+            <string>NSPrivacyCollectedDataTypeUserID</string>
+            <key>NSPrivacyCollectedDataTypeLinked</key>
+            <true/>
+            <key>NSPrivacyCollectedDataTypeTracking</key>
+            <false/>
+            <key>NSPrivacyCollectedDataTypePurposes</key>
+            <array>
+                <string>NSPrivacyCollectedDataTypePurposeAnalytics</string>
+                <string>NSPrivacyCollectedDataTypePurposeThirdPartyAdvertising</string>
+            </array>
+        </dict>
+        <!-- Events, screens (automatic UIKit swizzle), sessions, lifecycle. -->
         <dict>
             <key>NSPrivacyCollectedDataType</key>
             <string>NSPrivacyCollectedDataTypeProductInteraction</string>
             <key>NSPrivacyCollectedDataTypeLinked</key>
-            <false/>
+            <true/>
             <key>NSPrivacyCollectedDataTypeTracking</key>
             <false/>
             <key>NSPrivacyCollectedDataTypePurposes</key>
             <array>
                 <string>NSPrivacyCollectedDataTypePurposeAnalytics</string>
+                <string>NSPrivacyCollectedDataTypePurposeThirdPartyAdvertising</string>
             </array>
         </dict>
-        <!-- CommerceModule observes StoreKit 1/2 transactions and sends
-             purchase/subscription events (revenue, product_id) — audit M3
-             found this missing from the original declaration. -->
+        <!-- trackPurchase / CommerceModule (StoreKit auto-capture is OFF by
+             default) and the RevenueCat / Superwall bridges: revenue,
+             currency, product_id, transaction_id. -->
         <dict>
             <key>NSPrivacyCollectedDataType</key>
             <string>NSPrivacyCollectedDataTypePurchaseHistory</string>
             <key>NSPrivacyCollectedDataTypeLinked</key>
-            <false/>
+            <true/>
             <key>NSPrivacyCollectedDataTypeTracking</key>
             <false/>
             <key>NSPrivacyCollectedDataTypePurposes</key>
             <array>
                 <string>NSPrivacyCollectedDataTypePurposeAnalytics</string>
+                <string>NSPrivacyCollectedDataTypePurposeThirdPartyAdvertising</string>
             </array>
         </dict>
+        <!-- Click identifiers and campaign parameters captured for
+             attribution (fbclid, gclid, ttclid, msclkid, li_fat_id, UTMs,
+             the AdServices token) and forwarded to the matching network. -->
         <dict>
             <key>NSPrivacyCollectedDataType</key>
-            <string>NSPrivacyCollectedDataTypeCrashData</string>
+            <string>NSPrivacyCollectedDataTypeAdvertisingData</string>
             <key>NSPrivacyCollectedDataTypeLinked</key>
-            <false/>
+            <true/>
             <key>NSPrivacyCollectedDataTypeTracking</key>
             <false/>
             <key>NSPrivacyCollectedDataTypePurposes</key>
             <array>
-                <string>NSPrivacyCollectedDataTypePurposeAppFunctionality</string>
-            </array>
-        </dict>
-        <dict>
-            <key>NSPrivacyCollectedDataType</key>
-            <string>NSPrivacyCollectedDataTypePerformanceData</string>
-            <key>NSPrivacyCollectedDataTypeLinked</key>
-            <false/>
-            <key>NSPrivacyCollectedDataTypeTracking</key>
-            <false/>
-            <key>NSPrivacyCollectedDataTypePurposes</key>
-            <array>
-                <string>NSPrivacyCollectedDataTypePurposeAnalytics</string>
+                <string>NSPrivacyCollectedDataTypePurposeThirdPartyAdvertising</string>
+                <string>NSPrivacyCollectedDataTypePurposeDeveloperAdvertising</string>
             </array>
         </dict>
     </array>

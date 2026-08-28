@@ -163,7 +163,8 @@ public struct LayersConfig: Sendable {
     /// Opt-in-by-default mode. When `true`, the SDK queues events but does
     /// NOT flush until the host app makes its first explicit `setConsent`
     /// call granting `analyticsStorage`. This is stricter than the default
-    /// Consent Mode v2 posture (which already defaults to Denied) — it
+    /// posture (every consent category is Granted until explicitly denied
+    /// as of 3.2.13) — it
     /// explicitly waits for affirmative user action.
     public let consentRequired: Bool
 
@@ -3227,7 +3228,7 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
     /// The Swift wrapper's own version, reported as `swift/<version>` in
     /// `X-SDK-Version`. Kept in lockstep with the rest of the repo by
     /// scripts/check-versions.sh.
-    static let sdkVersion = "3.2.13"
+    static let sdkVersion = "3.2.14"
 
     /// Return the SDK version string.
     ///
