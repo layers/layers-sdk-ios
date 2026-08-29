@@ -57,8 +57,8 @@ public final class ATTModule: @unchecked Sendable {
 
     private let lock = NSLock()
     private var _core: LayersCoreHandle?
-    /// Mirrors ``LayersConfig/attDrivesAdvertisingConsent``.
-    private var _drivesAdvertisingConsent = true
+    /// Legacy opt-in mirroring from ATT status to Layers ad consent.
+    private var _drivesAdvertisingConsent = false
     /// Set once the host app sets any ad category itself — from then on the
     /// app owns them and ATT stops writing them.
     private var _appOwnsAdConsent = false
@@ -207,7 +207,7 @@ public final class ATTModule: @unchecked Sendable {
         guard let core = lockedCore, let sdk = lockedSdk else { return }
         let currentStatus = status ?? getStatus()
         sdk.applyATTDeviceContext(
-            idfa: getAdvertisingId(),
+            idfa: currentStatus == .authorized ? getAdvertisingId() : nil,
             idfv: getVendorId(),
             attStatus: currentStatus.rawValue,
             core: core
@@ -216,9 +216,9 @@ public final class ATTModule: @unchecked Sendable {
         mirrorToAdvertisingConsent(status: currentStatus, core: core)
     }
 
-    // MARK: - ATT → advertising consent
+    // MARK: - Legacy ATT → advertising consent compatibility
 
-    /// The Consent Mode v2 ad-category verdict an ATT answer implies.
+    /// The legacy Consent Mode v2 ad-category verdict for an ATT answer.
     ///
     /// `nil` means "no verdict": the user has not answered the prompt, so
     /// consent must be left exactly as it is rather than manufacturing a
@@ -256,18 +256,11 @@ public final class ATTModule: @unchecked Sendable {
         ))
     }
 
-    /// Mirror an ATT answer into ad consent, unless the app opted out or has
-    /// taken ownership of the ad categories itself.
-    ///
-    /// Apple's ATT prompt IS the user's advertising-tracking decision on iOS,
-    /// and without this the IDFA collected in `syncToCore` never leaves the
-    /// device: the core copies `idfa` / `att_status` onto an event only while
-    /// `ad_storage` is granted (`core/src/client.rs` `build_event`), and
-    /// `ad_storage` reads as DENIED while unset (`core/src/consent.rs`
-    /// `advertising_allowed` — `unwrap_or(false)`). React Native, Expo, Unity
-    /// and Flutter all already mirror ATT this way; Swift did not, so an
-    /// ATT-authorized user's IDFA was discarded on every single event unless
-    /// the host app knew to call `setConsent` itself.
+    /// Preserve the deprecated opt-in behavior that mirrors an ATT answer into
+    /// Layers ad consent. New configurations leave this disabled: ATT status
+    /// and IDFA availability are recorded independently, while the host app
+    /// updates Layers consent explicitly. If the app has already set an ad
+    /// category, its explicit decision wins in both directions.
     private func mirrorToAdvertisingConsent(status: Status, core: LayersCoreHandle) {
         lock.lock()
         let enabled = _drivesAdvertisingConsent

@@ -168,22 +168,24 @@ public struct LayersConfig: Sendable {
     /// explicitly waits for affirmative user action.
     public let consentRequired: Bool
 
-    /// Whether an App Tracking Transparency answer sets advertising consent.
-    /// Defaults to `true`.
+    /// Deprecated compatibility switch that mirrors an App Tracking
+    /// Transparency answer into the three Consent Mode v2 ad categories.
+    /// Defaults to `false`.
     ///
-    /// On iOS the ATT prompt *is* the user's advertising-tracking decision, so
-    /// `.authorized` grants the three Consent Mode v2 ad categories
-    /// (`adStorage`, `adUserData`, `adPersonalization`) and
-    /// `.denied` / `.restricted` deny them. Without this the IDFA the SDK
-    /// collects after an ATT grant never reaches the wire — the core strips
-    /// `idfa` and `att_status` from every event while `adStorage` is denied,
-    /// and it is denied until something grants it.
-    ///
-    /// Set to `false` if a consent management platform owns the ad categories.
-    /// Note that calling ``Layers/setConsent(_:)`` with any ad category set
-    /// also hands ownership to the app permanently — from that point ATT
-    /// answers no longer touch consent, whatever this flag says.
-    public let attDrivesAdvertisingConsent: Bool
+    /// ATT controls whether IDFA is available; it does not change Layers
+    /// consent by default. Call ``Layers/setConsent(_:)`` explicitly when the
+    /// app wants to update `adStorage`, `adUserData`, or `adPersonalization`.
+    /// Passing `true` preserves the legacy mirroring behavior for existing
+    /// integrations. An explicit ad-category consent update still takes
+    /// ownership and prevents later ATT answers from overwriting it.
+    @available(*, deprecated, message: "ATT no longer changes Layers consent by default. Call Layers.setConsent(_:) explicitly.")
+    public var attDrivesAdvertisingConsent: Bool {
+        _legacyATTDrivesAdvertisingConsent
+    }
+
+    /// Backing storage lets internal compatibility wiring avoid referring to
+    /// the deprecated public accessor.
+    fileprivate let _legacyATTDrivesAdvertisingConsent: Bool
 
     public init(
         appId: String,
@@ -199,7 +201,7 @@ public struct LayersConfig: Sendable {
         automaticScreenTrackingEnabled: Bool = true,
         automaticPurchaseTrackingEnabled: Bool = false,
         consentRequired: Bool = false,
-        attDrivesAdvertisingConsent: Bool = true,
+        attDrivesAdvertisingConsent: Bool = false,
         featureFlagBootstrap: BootstrapData? = nil
     ) {
         self.appId = appId
@@ -215,7 +217,7 @@ public struct LayersConfig: Sendable {
         self.automaticScreenTrackingEnabled = automaticScreenTrackingEnabled
         self.automaticPurchaseTrackingEnabled = automaticPurchaseTrackingEnabled
         self.consentRequired = consentRequired
-        self.attDrivesAdvertisingConsent = attDrivesAdvertisingConsent
+        self._legacyATTDrivesAdvertisingConsent = attDrivesAdvertisingConsent
         self.featureFlagBootstrap = featureFlagBootstrap
     }
 }
@@ -224,20 +226,19 @@ public struct LayersConfig: Sendable {
 
 /// Consent across the four Firebase Consent Mode v2 categories.
 ///
-/// All four fields default to `nil` (treated as Denied for gating). The
-/// `analytics` / `advertising` fields are deprecated aliases retained for
-/// pre–Tier-9 callers; new code should set the explicit v2 fields.
-///
-/// Defaults are aligned with Consent Mode v2's opt-in posture: nothing
-/// flushes to the network until the host app sets `analyticsStorage = true`.
+/// All four fields default to `nil` and are allowed unless explicitly denied.
+/// When ``LayersConfig/consentRequired`` is enabled, `analyticsStorage` must
+/// instead be explicitly granted before events flush. The `analytics` /
+/// `advertising` fields are deprecated aliases retained for pre–Tier-9
+/// callers; new code should set the explicit v2 fields.
 public struct ConsentSettings: Sendable, Equatable {
-    /// Gates analytics events. CMv2 default: Denied.
+    /// Gates analytics events. Allowed unless explicitly denied.
     public var analyticsStorage: Bool?
-    /// Gates ad-related identifiers (IDFA, click IDs). CMv2 default: Denied.
+    /// Gates ad-related identifiers (IDFA, click IDs). Allowed unless explicitly denied.
     public var adStorage: Bool?
-    /// Gates user data being forwarded to ad partners. CMv2 default: Denied.
+    /// Gates user data being forwarded to ad partners. Allowed unless explicitly denied.
     public var adUserData: Bool?
-    /// Gates personalized advertising. CMv2 default: Denied.
+    /// Gates personalized advertising. Allowed unless explicitly denied.
     public var adPersonalization: Bool?
 
     /// DEPRECATED — alias for `analyticsStorage`.
@@ -600,7 +601,7 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
         att.attach(
             core: handle,
             sdk: self,
-            drivesAdvertisingConsent: config.attDrivesAdvertisingConsent
+            drivesAdvertisingConsent: config._legacyATTDrivesAdvertisingConsent
         )
         deepLinks.attach(core: handle)
         commerce.attach(core: handle, skan: skan)
@@ -1718,10 +1719,10 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
     /// On a Denied → Granted transition for `analyticsStorage`, the Rust core
     /// auto-drains queued events.
     ///
-    /// Setting any ad category (`adStorage`, `adUserData`, `adPersonalization`)
-    /// hands ownership of all three to the app: App Tracking Transparency
-    /// answers stop writing them, so an explicit grant is never downgraded by a
-    /// later ATT denial. See ``LayersConfig/attDrivesAdvertisingConsent``.
+    /// If the deprecated ATT-to-consent compatibility switch is enabled,
+    /// setting any ad category (`adStorage`, `adUserData`,
+    /// `adPersonalization`) hands ownership of all three to the app. Later ATT
+    /// answers then leave the explicit consent state unchanged.
     @discardableResult
     public func setConsent(_ consent: ConsentSettings) -> SafeResult<Void> {
         guard let core = lockedCoreIfInitialized() else {
@@ -2593,7 +2594,7 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
             screenSize: base?.screenSize,
             installId: base?.installId,
             idfa: idfa,
-            idfv: idfv,
+            idfv: idfv ?? base?.idfv,
             attStatus: attStatus,
             deeplinkId: base?.deeplinkId,
             gclid: base?.gclid,
@@ -3228,7 +3229,7 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
     /// The Swift wrapper's own version, reported as `swift/<version>` in
     /// `X-SDK-Version`. Kept in lockstep with the rest of the repo by
     /// scripts/check-versions.sh.
-    static let sdkVersion = "3.2.14"
+    static let sdkVersion = "3.3.0"
 
     /// Return the SDK version string.
     ///
