@@ -52,6 +52,12 @@ public enum StandardEvent: String, LayersEvent, Sendable {
     case share = "share"
     case deepLink = "deep_link_opened"
     case screenView = "screen_view"
+    // First-run funnel. The server reads `paywall_view`, `paywall_viewed` and
+    // `paywall_shown` as aliases of `paywall_show`, so apps already sending any of
+    // those names keep their history.
+    case onboardingStart = "onboarding_start"
+    case onboardingComplete = "onboarding_complete"
+    case paywallShow = "paywall_show"
 
     public var eventName: String { rawValue }
     public var properties: [String: Any] { [:] }
@@ -68,8 +74,9 @@ public struct ParameterizedEvent: LayersEvent, @unchecked Sendable {
     // compiler — so this needs `@unchecked` (a plain `Sendable` conformance here
     // does not compile-time-verify and was silently unchecked-by-comment only; the
     // keyword now says what the comment already claimed). We only ever store
-    // JSON-serializable primitives (String, NSNumber, Bool) which are all
-    // genuinely Sendable values, making this safe for cross-isolation use.
+    // JSON-serializable values — String, NSNumber, Bool, and `[String]` for
+    // `product_ids` — which are all genuinely Sendable, making this safe for
+    // cross-isolation use.
 
     init(eventName: String, properties: [String: Any]) {
         self.eventName = eventName
@@ -219,5 +226,29 @@ extension StandardEvent {
         var props: [String: Any] = ["screen_name": name]
         if let screenClass { props["screen_class"] = screenClass }
         return ParameterizedEvent(eventName: Self.screenView.rawValue, properties: props)
+    }
+
+    // MARK: First-run funnel
+
+    /// Create an onboarding-start event with the optional name of the first onboarding screen.
+    public static func onboardingStart(screenName: String? = nil) -> ParameterizedEvent {
+        var props: [String: Any] = [:]
+        if let screenName { props["screen_name"] = screenName }
+        return ParameterizedEvent(eventName: Self.onboardingStart.rawValue, properties: props)
+    }
+
+    /// Create an onboarding-complete event with the optional name of the screen the user finished on.
+    public static func onboardingComplete(screenName: String? = nil) -> ParameterizedEvent {
+        var props: [String: Any] = [:]
+        if let screenName { props["screen_name"] = screenName }
+        return ParameterizedEvent(eventName: Self.onboardingComplete.rawValue, properties: props)
+    }
+
+    /// Create a paywall-show event. `placement` names where the paywall appeared
+    /// (e.g. "onboarding", "settings"); `productIds` lists the products offered.
+    public static func paywallShow(placement: String, productIds: [String]? = nil) -> ParameterizedEvent {
+        var props: [String: Any] = ["placement": placement]
+        if let productIds { props["product_ids"] = productIds }
+        return ParameterizedEvent(eventName: Self.paywallShow.rawValue, properties: props)
     }
 }

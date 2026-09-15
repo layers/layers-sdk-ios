@@ -8,25 +8,34 @@ import os.log
 ///
 /// 1. **Obj-C uncaught exceptions** via `NSSetUncaughtExceptionHandler`. Runs in
 ///    a normal Foundation context, so we can capture `callStackSymbols`,
-///    `callStackReturnAddresses`, `name`, and `reason`.
+///    `callStackReturnAddresses`, `name`, and `reason`. On by default through
+///    `LayersConfig.automaticExceptionTrackingEnabled`.
 /// 2. **POSIX signals** (`SIGABRT`, `SIGSEGV`, `SIGBUS`, `SIGFPE`, `SIGILL`,
-///    `SIGTRAP`, `SIGPIPE`) via `signal()`. The handler runs in async-signal-safe
-///    territory: we cannot allocate, take ObjC locks, call Foundation. We use
-///    `backtrace()` (documented as async-signal-safe on Darwin) to collect raw
-///    return addresses, then write a minimal record using POSIX `write()` to a
-///    pre-allocated path. After the record is on disk, we reinstall the default
-///    handler and re-raise so the OS still produces a crash log.
+///    `SIGTRAP`) via `signal()`. Opt-in through
+///    `LayersConfig.signalCrashCaptureEnabled`. The handler collects
+///    `backtrace()` addresses, writes a minimal record with POSIX `write()` to a
+///    path resolved at install time, chains to the handler that was installed
+///    before it, and then always hands the signal to the default action so the
+///    OS still produces its crash log. The handler is not yet async-signal-safe:
+///    it allocates while formatting the record, so a crash that already holds
+///    the malloc lock (heap corruption) can deadlock inside it instead of
+///    crashing. That is why it stays off until it is rewritten with
+///    pre-allocated buffers.
 ///
 /// Crash records persist to `<persistenceDir>/layers-pending-crash.json`.
-/// On the **next** launch, `flushPendingCrashes(sdk:)` reads, deletes, and emits
-/// `$exception` events with `exception_handled = false`.
+/// On the **next** launch, `flushPendingCrashes` reads, deletes, and emits an
+/// `$exception` event with `$exception_handled = false`,
+/// `$exception_fatal = true`, and `$exception_occurred_at` taken from the
+/// record, so the crash keeps its own time rather than the next launch's.
 ///
-/// **Symbolication is server-side.** We emit raw return addresses + image base
-/// + image UUID for each frame so a server-side dSYM resolver can produce
-/// human-readable stacks. PR description includes the dSYM upload step.
+/// Property names follow the canonical `$exception_*` set every other platform
+/// emits (`docs/internal/tier-5-server-handoff.md`). The ingest service
+/// rejects an `$exception` that lacks `$exception_type` or
+/// `$exception_message`, and a rejected batch is dropped whole, so a record
+/// missing either is discarded here instead of emitted.
 ///
-/// **Default: ON** (recommended — matches Sentry/Crashlytics posture). Opt out
-/// via `LayersConfig(automaticExceptionTrackingEnabled: false)`.
+/// **Symbolication is server-side.** We emit raw return addresses so a
+/// server-side dSYM resolver can produce human-readable stacks.
 @available(iOS 14.0, macOS 12.0, tvOS 14.0, watchOS 7.0, *)
 public final class ExceptionModule: @unchecked Sendable {
 
@@ -34,23 +43,33 @@ public final class ExceptionModule: @unchecked Sendable {
 
     public static let pendingCrashFilename = "layers-pending-crash.json"
 
-    /// All signals we install handlers for. Pre-existing handlers (if any) are
-    /// preserved and chained on the first uncaught crash.
-    private static let trappedSignals: [Int32] = [
-        SIGABRT, SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGTRAP, SIGPIPE,
+    /// Fatal signals the opt-in signal capture traps. `SIGPIPE` is absent on
+    /// purpose: networking stacks ignore it process-wide, and a handler that
+    /// re-raises it would turn a write to a closed socket into an app kill.
+    static let trappedSignals: [Int32] = [
+        SIGABRT, SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGTRAP,
     ]
+
+    /// Caps that keep one crash from producing a payload the ingest rejects.
+    static let maxMessageChars = 4_000
+    static let maxStackTraceChars = 10_000
+    static let maxReturnAddresses = 64
+    static let maxUserInfoChars = 1_000
 
     /// Closure-based emitter used for unit tests and the production wiring.
     public typealias Emitter = (_ event: String, _ properties: [String: Any]) -> Void
 
     // MARK: - Static State (signal handlers can't capture instance state)
 
-    /// Pre-allocated C string for the crash file path. Set ONCE during
-    /// `installHandlers`. Read from the signal handler — never mutated post-install.
+    /// C string for the crash file path. Resolved on the first install and
+    /// never reassigned while handlers are installed: the signal handler
+    /// holds a pointer into this buffer.
     private static var crashFilePathCString: [CChar] = []
 
-    /// Becomes `true` after at least one handler is installed.
+    /// `true` once the NSException handler is installed.
     private static var handlersInstalled = false
+    /// `true` once the (opt-in) signal handlers are installed.
+    private static var signalHandlersInstalled = false
     private static let installLock = NSLock()
 
     /// Captures whatever uncaught-exception handler was in place before us so
@@ -65,6 +84,7 @@ public final class ExceptionModule: @unchecked Sendable {
     private let lock = NSLock()
     private var emitter: Emitter?
     private var enabled = false
+    private var automaticCaptureEnabled = false
 
     /// Directory provided at attach time. Internal so tests can verify.
     var attachedPersistenceDir: String?
@@ -78,26 +98,45 @@ public final class ExceptionModule: @unchecked Sendable {
     // MARK: - Attach / Detach
 
     /// Attach to the Layers singleton. Production entry point.
-    func attach(sdk: Layers, persistenceDir: String) {
+    ///
+    /// The emitter is always wired, so `captureException` works whatever the
+    /// flags say. The process-wide handlers and the pending-crash drain follow
+    /// `automaticCapture`; the signal handlers additionally need
+    /// `captureSignals`.
+    func attach(
+        sdk: Layers,
+        persistenceDir: String,
+        automaticCapture: Bool = true,
+        captureSignals: Bool = false
+    ) {
         attach(
             emitter: { [weak sdk] event, props in
                 _ = sdk?.track(event, properties: props)
             },
-            persistenceDir: persistenceDir
+            persistenceDir: persistenceDir,
+            automaticCapture: automaticCapture,
+            captureSignals: captureSignals
         )
     }
 
     /// Attach with an explicit emitter — used by both production and tests.
     /// `persistenceDir` is where the pending-crash file lives between launches.
-    func attach(emitter: @escaping Emitter, persistenceDir: String) {
+    func attach(
+        emitter: @escaping Emitter,
+        persistenceDir: String,
+        automaticCapture: Bool = true,
+        captureSignals: Bool = false
+    ) {
         lock.lock()
         self.emitter = emitter
         attachedPersistenceDir = persistenceDir
         enabled = true
+        automaticCaptureEnabled = automaticCapture
         lock.unlock()
 
-        Self.installHandlers(persistenceDir: persistenceDir)
-        Self._setActiveForTesting(self)
+        Self.setActive(self)
+        guard automaticCapture else { return }
+        Self.installHandlers(persistenceDir: persistenceDir, captureSignals: captureSignals)
         // Drain any pending crash from the previous launch.
         flushPendingCrashes(persistenceDir: persistenceDir)
     }
@@ -105,12 +144,32 @@ public final class ExceptionModule: @unchecked Sendable {
     func detach() {
         lock.lock()
         enabled = false
+        automaticCaptureEnabled = false
         emitter = nil
+        attachedPersistenceDir = nil
         lock.unlock()
-        // We deliberately leave the C handlers in place — uninstalling signal
-        // handlers mid-run risks losing crash data, and the SDK is normally
-        // singleton + process-lifetime. The handlers will see `_active == nil`
-        // and write a minimal record but skip the emit, which is safe.
+        // The C handlers stay installed: uninstalling signal handlers mid-run
+        // risks losing crash data, and the SDK is normally process-lifetime.
+        // They keep writing the record for the next launch to drain; nothing
+        // is emitted from a detached instance, and the active reference is
+        // cleared so no handler can reach it.
+        Self.setActive(nil)
+    }
+
+    /// Whether `attach` has run and `detach` has not. Internal so the wiring
+    /// tests can assert what `Layers.initialize` did.
+    var isAttached: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return enabled
+    }
+
+    /// Whether this attach installed the process-wide handlers and drained
+    /// the pending crash, as opposed to wiring the emitter alone.
+    var isAutomaticCaptureEnabled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return automaticCaptureEnabled
     }
 
     // MARK: - Active Singleton (for handlers to find)
@@ -124,66 +183,85 @@ public final class ExceptionModule: @unchecked Sendable {
         return _active
     }
 
+    private static func setActive(_ module: ExceptionModule?) {
+        activeLock.lock()
+        _active = module
+        activeLock.unlock()
+    }
+
     // MARK: - Handler Installation
 
-    static func installHandlers(persistenceDir: String) {
+    static func installHandlers(persistenceDir: String, captureSignals: Bool = false) {
         installLock.lock()
         defer { installLock.unlock() }
 
-        // Always update the active reference + path even if handlers already exist.
-        let path = (persistenceDir as NSString).appendingPathComponent(pendingCrashFilename)
-        crashFilePathCString = path.utf8CString.map { CChar($0) }
+        if !handlersInstalled {
+            // Resolved once. Re-attaching with another directory keeps the
+            // first path: the signal handler may hold a pointer into it.
+            let path = (persistenceDir as NSString).appendingPathComponent(pendingCrashFilename)
+            crashFilePathCString = path.utf8CString.map { CChar($0) }
+            handlersInstalled = true
 
-        if handlersInstalled { return }
-        handlersInstalled = true
-
-        // 1) NSException
-        previousNSExceptionHandler = NSGetUncaughtExceptionHandler().map { handler in
-            { exception in
-                handler(exception)
+            // 1) NSException
+            previousNSExceptionHandler = NSGetUncaughtExceptionHandler().map { handler in
+                { exception in
+                    handler(exception)
+                }
+            }
+            NSSetUncaughtExceptionHandler { exception in
+                ExceptionModule.handleNSException(exception)
             }
         }
-        NSSetUncaughtExceptionHandler { exception in
-            ExceptionModule.handleNSException(exception)
-        }
 
-        // 2) Signal handlers
-        for sig in trappedSignals {
-            let prior = signal(sig, ExceptionModule.handleSignal)
-            // sig_t (a `@convention(c)` function pointer) is not Equatable, so
-            // we go through an unsafe bit-pattern compare to filter out
-            // SIG_DFL (NULL) and SIG_IGN (special sentinel).
-            if let prior = prior, !isDefaultOrIgnore(prior) {
-                previousSignalHandlers[sig] = prior
+        // 2) Signal handlers (opt-in)
+        if captureSignals && !signalHandlersInstalled {
+            signalHandlersInstalled = true
+            for sig in trappedSignals {
+                let prior = signal(sig, ExceptionModule.handleSignal)
+                // sig_t (a `@convention(c)` function pointer) is not Equatable, so
+                // we go through an unsafe bit-pattern compare to filter out
+                // SIG_DFL (NULL), SIG_IGN, and SIG_ERR.
+                if let prior = prior, isChainable(prior) {
+                    previousSignalHandlers[sig] = prior
+                }
             }
         }
     }
 
-    /// Returns `true` if `handler` is `SIG_DFL` or `SIG_IGN`. Because `sig_t`
-    /// is `@convention(c)`, normal `==` doesn't compile — we compare via raw
-    /// pointers.
-    private static func isDefaultOrIgnore(_ handler: sig_t) -> Bool {
+    /// `true` when `handler` is a real function we can chain to: not `SIG_DFL`,
+    /// `SIG_IGN`, or the `SIG_ERR` that `signal()` returns on failure, which
+    /// must never be called as a function pointer.
+    static func isChainable(_ handler: sig_t) -> Bool {
         let raw = unsafeBitCast(handler, to: UnsafeRawPointer.self)
         let dfl = unsafeBitCast(SIG_DFL, to: UnsafeRawPointer?.self)
         let ign = unsafeBitCast(SIG_IGN, to: UnsafeRawPointer.self)
-        if let dfl = dfl, raw == dfl { return true }
-        if raw == ign { return true }
-        return false
+        let err = unsafeBitCast(SIG_ERR, to: UnsafeRawPointer.self)
+        if let dfl = dfl, raw == dfl { return false }
+        if raw == ign { return false }
+        if raw == err { return false }
+        return true
     }
 
     // MARK: - NSException Handler
 
     fileprivate static func handleNSException(_ exception: NSException) {
         // Snapshot the relevant data before we forward to a chained handler.
+        let addresses = exception.callStackReturnAddresses
+            .prefix(maxReturnAddresses)
+            .map { $0.stringValue }
         let report: [String: Any] = [
-            "source": "nsexception",
-            "exception_type": exception.name.rawValue,
-            "exception_message": exception.reason ?? "",
-            "exception_stacktrace": exception.callStackSymbols.joined(separator: "\n"),
-            "return_addresses": exception.callStackReturnAddresses.map { $0.stringValue },
-            "exception_handled": false,
-            "timestamp": Date().timeIntervalSince1970,
-            "user_info": exception.userInfo?.description ?? "",
+            "$exception_source": "nsexception",
+            "$exception_type": exception.name.rawValue,
+            "$exception_message": truncate(exception.reason ?? "", to: maxMessageChars),
+            "$exception_stack_trace_raw": truncate(
+                exception.callStackSymbols.joined(separator: "\n"),
+                to: maxStackTraceChars
+            ),
+            "$exception_return_addresses": Array(addresses),
+            "$exception_handled": false,
+            "$exception_fatal": true,
+            "$exception_occurred_at": iso8601(Date()),
+            "$exception_user_info": truncate(exception.userInfo?.description ?? "", to: maxUserInfoChars),
         ]
         writeCrashReportSync(report)
 
@@ -206,28 +284,28 @@ public final class ExceptionModule: @unchecked Sendable {
     // MARK: - Signal Handler
 
     /// `@convention(c)` because `signal()` requires a C function pointer.
-    /// **Async-signal-safe only.** No Swift String literals in the hot path,
-    /// no Foundation, no allocation.
+    /// Not yet async-signal-safe (see the type doc); installed only when the
+    /// host opts in.
     private static let handleSignal: sig_t = { sig in
         // Capture backtrace addresses (async-signal-safe per Darwin docs).
-        var addresses = [UnsafeMutableRawPointer?](repeating: nil, count: 64)
-        let count = backtrace(&addresses, 64)
+        var addresses = [UnsafeMutableRawPointer?](repeating: nil, count: maxReturnAddresses)
+        let count = backtrace(&addresses, Int32(maxReturnAddresses))
 
         writeSignalCrashRecord(signal: sig, addresses: addresses, count: count)
 
-        // Restore prior handler (if any) and re-raise so the OS still
-        // produces a crash log + the OS's crash reporter still runs.
-        if let prior = previousSignalHandlers[sig], !isDefaultOrIgnore(prior) {
+        // Chain to the handler that was installed before us, then always hand
+        // the signal to the default action. A chained handler that returns
+        // (Crashlytics and Sentry do, on several paths) would otherwise resume
+        // the faulting instruction and fault again forever.
+        if let prior = previousSignalHandlers[sig], isChainable(prior) {
             prior(sig)
-        } else {
-            signal(sig, SIG_DFL)
-            raise(sig)
         }
+        signal(sig, SIG_DFL)
+        raise(sig)
     }
 
-    /// Async-signal-safe writer. We pre-format using `snprintf` into a static
-    /// buffer, then write() to the pre-resolved path. JSON is hand-rolled
-    /// because Foundation isn't safe here.
+    /// Writer for the signal path. Hand-rolled JSON because Foundation is not
+    /// safe here; `write()` and `time()` are async-signal-safe.
     private static func writeSignalCrashRecord(
         signal sig: Int32,
         addresses: [UnsafeMutableRawPointer?],
@@ -238,15 +316,18 @@ public final class ExceptionModule: @unchecked Sendable {
         var buffer = [CChar](repeating: 0, count: bufferSize)
         var offset = 0
 
-        let header = "{\"source\":\"signal\",\"signal\":\(sig),\"timestamp\":"
+        let header = "{\"$exception_source\":\"signal\",\"$exception_signal\":\(sig),\"$exception_occurred_at_epoch\":"
         offset = appendCString(header, into: &buffer, offset: offset)
 
-        // time(2) is async-signal-safe.
         var ts: time_t = 0
         time(&ts)
         offset = appendCString(String(ts), into: &buffer, offset: offset)
 
-        offset = appendCString(",\"exception_handled\":false,\"return_addresses\":[", into: &buffer, offset: offset)
+        offset = appendCString(
+            ",\"$exception_handled\":false,\"$exception_fatal\":true,\"$exception_return_addresses\":[",
+            into: &buffer,
+            offset: offset
+        )
 
         for i in 0..<Int(count) {
             if i > 0 {
@@ -326,7 +407,8 @@ public final class ExceptionModule: @unchecked Sendable {
 
     /// Manually emit an `$exception` for a caught error. Useful inside a
     /// `do/catch` block when the host app handles an error but still wants it
-    /// in analytics.
+    /// in analytics. Works whenever the module is attached, including with
+    /// `automaticExceptionTrackingEnabled: false`.
     @discardableResult
     public func captureException(
         _ error: Error,
@@ -341,11 +423,12 @@ public final class ExceptionModule: @unchecked Sendable {
 
         var props = properties
         let ns = error as NSError
-        props["exception_type"] = String(describing: type(of: error))
-        props["exception_message"] = ns.localizedDescription
-        props["exception_handled"] = handled
-        props["error_domain"] = ns.domain
-        props["error_code"] = ns.code
+        props["$exception_type"] = String(describing: type(of: error))
+        props["$exception_message"] = Self.truncate(ns.localizedDescription, to: Self.maxMessageChars)
+        props["$exception_handled"] = handled
+        props["$exception_fatal"] = false
+        props["$exception_error_domain"] = ns.domain
+        props["$exception_error_code"] = ns.code
         emit("$exception", props)
         return .success(())
     }
@@ -377,19 +460,31 @@ public final class ExceptionModule: @unchecked Sendable {
 
         var props = raw
         // Normalize signal-source records into the canonical $exception schema.
-        if (raw["source"] as? String) == "signal" {
+        if (raw["$exception_source"] as? String) == "signal" {
             let sigInt: Int?
-            if let s = raw["signal"] as? Int { sigInt = s }
-            else if let s = raw["signal"] as? Int32 { sigInt = Int(s) }
-            else if let s = raw["signal"] as? NSNumber { sigInt = s.intValue }
+            if let s = raw["$exception_signal"] as? Int { sigInt = s }
+            else if let s = raw["$exception_signal"] as? Int32 { sigInt = Int(s) }
+            else if let s = raw["$exception_signal"] as? NSNumber { sigInt = s.intValue }
             else { sigInt = nil }
             if let sig = sigInt {
                 let sigName = signalName(Int32(sig))
-                props["exception_type"] = sigName
-                props["exception_message"] = "Crashed on \(sigName) (\(sig))"
+                props["$exception_type"] = sigName
+                props["$exception_message"] = "Crashed on \(sigName) (\(sig))"
+            }
+            if let epoch = raw["$exception_occurred_at_epoch"] as? NSNumber {
+                props["$exception_occurred_at"] = Self.iso8601(Date(timeIntervalSince1970: epoch.doubleValue))
+                props.removeValue(forKey: "$exception_occurred_at_epoch")
             }
         }
-        props["exception_handled"] = false
+        props["$exception_handled"] = false
+        props["$exception_fatal"] = true
+
+        // The ingest rejects an $exception without a type and a message, and
+        // drops the whole batch with it; a partial record is not worth that.
+        guard props["$exception_type"] is String, props["$exception_message"] is String else {
+            os_log("Discarding pending crash report without a type and message", log: Self.log, type: .error)
+            return
+        }
         emit("$exception", props)
     }
 
@@ -418,14 +513,26 @@ public final class ExceptionModule: @unchecked Sendable {
         }
     }
 
+    static func truncate(_ s: String, to max: Int) -> String {
+        s.count > max ? String(s.prefix(max)) : s
+    }
+
+    private static let iso8601Formatter: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
+
+    static func iso8601(_ date: Date) -> String {
+        iso8601Formatter.string(from: date)
+    }
+
     // MARK: - Test Helpers
 
     /// Internal hook that stamps the active reference. Tests call this so the
     /// signal handler path can find the module without going through full attach.
     static func _setActiveForTesting(_ module: ExceptionModule?) {
-        activeLock.lock()
-        _active = module
-        activeLock.unlock()
+        setActive(module)
     }
 
     /// Reset all install state. Tests use this so a second `installHandlers`
@@ -433,6 +540,7 @@ public final class ExceptionModule: @unchecked Sendable {
     static func _resetInstallStateForTesting() {
         installLock.lock()
         handlersInstalled = false
+        signalHandlersInstalled = false
         previousNSExceptionHandler = nil
         previousSignalHandlers.removeAll()
         crashFilePathCString = []

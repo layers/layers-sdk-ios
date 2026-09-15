@@ -154,32 +154,50 @@ public final class CommerceModule: @unchecked Sendable {
         task?.cancel()
     }
 
+    // MARK: - Property Encoding
+
+    /// A monetary `Decimal` as a JSON **number**, exactly.
+    ///
+    /// Every one of these values used to ship as a JSON string
+    /// (`"price": "9.99"`), so `sum(price)` in the warehouse saw text while
+    /// Kotlin and Flutter sent real numbers for the same purchase.
+    ///
+    /// `NSDecimalNumber` rather than `Double` is deliberate.
+    /// `JSONSerialization` writes the decimal exactly — `9.99`, `0.01`,
+    /// `29.97`, `99999.99` — where the same values as `Double` come out as
+    /// `9.9900000000000002`. Revenue is the one column where that noise is
+    /// least acceptable, and a `Decimal` is what StoreKit hands us in the
+    /// first place.
+    static func money(_ value: Decimal) -> NSDecimalNumber {
+        NSDecimalNumber(decimal: value)
+    }
+
     // MARK: - Purchase Tracking
 
     @discardableResult
     public func trackPurchase(transaction: Transaction) -> SafeResult<Void> {
         guard let core = lockedCore else { return .failure(.notInitialized) }
-        let revenue = NSDecimalNumber(decimal: transaction.price * Decimal(transaction.quantity)).stringValue
-        var props: [String: String] = [
+        var props: [String: Any] = [
             "transaction_id": transaction.transactionId,
             "product_id": transaction.productId,
-            "price": NSDecimalNumber(decimal: transaction.price).stringValue,
+            "price": Self.money(transaction.price),
             "currency": transaction.currency,
-            "quantity": String(transaction.quantity),
-            "revenue": revenue,
-            "is_restored": String(transaction.isRestored),
+            "quantity": transaction.quantity,
+            "revenue": Self.money(transaction.price * Decimal(transaction.quantity)),
+            "is_restored": transaction.isRestored,
         ]
         if let g = transaction.subscriptionGroupId { props["subscription_group_id"] = g }
         if let o = transaction.originalTransactionId { props["original_transaction_id"] = o }
 
+        let propsJson = Layers.jsonString(from: props)
         do {
             try core.track(
                 eventName: "purchase_success",
-                propertiesJson: Layers.jsonString(from: props),
+                propertiesJson: propsJson,
                 userId: nil,
                 anonymousId: nil
             )
-            lockedSkan?.processEvent(eventName: "purchase", properties: props)
+            lockedSkan?.processEventJson(eventName: "purchase", propertiesJson: propsJson)
             return .success(())
         } catch {
             return .failure(Layers.mapError(error))
@@ -189,28 +207,32 @@ public final class CommerceModule: @unchecked Sendable {
     @discardableResult
     public func trackOrder(_ order: Order) -> SafeResult<Void> {
         guard let core = lockedCore else { return .failure(.notInitialized) }
-        var props: [String: String] = [
+        var props: [String: Any] = [
             "order_id": order.orderId,
-            "subtotal": NSDecimalNumber(decimal: order.subtotal).stringValue,
-            "total": NSDecimalNumber(decimal: order.total).stringValue,
+            "subtotal": Self.money(order.subtotal),
+            "total": Self.money(order.total),
             "currency": order.currency,
-            "item_count": String(order.items.count),
-            "revenue": NSDecimalNumber(decimal: order.total).stringValue,
+            "item_count": order.items.count,
+            "revenue": Self.money(order.total),
+            // Kept as a comma-joined string to match Kotlin's CommerceModule,
+            // which builds `product_ids` the same way. Changing the SHAPE of a
+            // property is a separate decision from fixing its type.
             "product_ids": order.items.map(\.productId).joined(separator: ","),
         ]
-        if let tax = order.tax { props["tax"] = NSDecimalNumber(decimal: tax).stringValue }
-        if let s = order.shipping { props["shipping"] = NSDecimalNumber(decimal: s).stringValue }
-        if let d = order.discount { props["discount"] = NSDecimalNumber(decimal: d).stringValue }
+        if let tax = order.tax { props["tax"] = Self.money(tax) }
+        if let s = order.shipping { props["shipping"] = Self.money(s) }
+        if let d = order.discount { props["discount"] = Self.money(d) }
         if let c = order.couponCode { props["coupon_code"] = c }
 
+        let propsJson = Layers.jsonString(from: props)
         do {
             try core.track(
                 eventName: "purchase_success",
-                propertiesJson: Layers.jsonString(from: props),
+                propertiesJson: propsJson,
                 userId: nil,
                 anonymousId: nil
             )
-            lockedSkan?.processEvent(eventName: "purchase", properties: props)
+            lockedSkan?.processEventJson(eventName: "purchase", propertiesJson: propsJson)
             return .success(())
         } catch {
             return .failure(Layers.mapError(error))
@@ -220,12 +242,12 @@ public final class CommerceModule: @unchecked Sendable {
     @discardableResult
     public func trackAddToCart(_ item: CartItem) -> SafeResult<Void> {
         guard let core = lockedCore else { return .failure(.notInitialized) }
-        var props: [String: String] = [
+        var props: [String: Any] = [
             "product_id": item.productId,
             "product_name": item.name,
-            "price": NSDecimalNumber(decimal: item.price).stringValue,
-            "quantity": String(item.quantity),
-            "value": NSDecimalNumber(decimal: item.total).stringValue,
+            "price": Self.money(item.price),
+            "quantity": item.quantity,
+            "value": Self.money(item.total),
         ]
         if let c = item.category { props["category"] = c }
         do {
@@ -244,11 +266,11 @@ public final class CommerceModule: @unchecked Sendable {
     @discardableResult
     public func trackRemoveFromCart(_ item: CartItem) -> SafeResult<Void> {
         guard let core = lockedCore else { return .failure(.notInitialized) }
-        var props: [String: String] = [
+        var props: [String: Any] = [
             "product_id": item.productId,
             "product_name": item.name,
-            "price": NSDecimalNumber(decimal: item.price).stringValue,
-            "quantity": String(item.quantity),
+            "price": Self.money(item.price),
+            "quantity": item.quantity,
         ]
         if let c = item.category { props["category"] = c }
         do {
@@ -268,20 +290,22 @@ public final class CommerceModule: @unchecked Sendable {
     public func trackBeginCheckout(items: [CartItem], currency: String = "USD") -> SafeResult<Void> {
         guard let core = lockedCore else { return .failure(.notInitialized) }
         let total = items.reduce(Decimal.zero) { $0 + $1.total }
-        let props: [String: String] = [
-            "item_count": String(items.count),
-            "value": NSDecimalNumber(decimal: total).stringValue,
+        let props: [String: Any] = [
+            "item_count": items.count,
+            "value": Self.money(total),
             "currency": currency,
+            // Comma-joined to match Kotlin's CommerceModule — see trackOrder.
             "product_ids": items.map(\.productId).joined(separator: ","),
         ]
+        let propsJson = Layers.jsonString(from: props)
         do {
             try core.track(
                 eventName: "begin_checkout",
-                propertiesJson: Layers.jsonString(from: props),
+                propertiesJson: propsJson,
                 userId: nil,
                 anonymousId: nil
             )
-            lockedSkan?.processEvent(eventName: "begin_checkout", properties: props)
+            lockedSkan?.processEventJson(eventName: "begin_checkout", propertiesJson: propsJson)
             return .success(())
         } catch {
             return .failure(Layers.mapError(error))
@@ -291,10 +315,10 @@ public final class CommerceModule: @unchecked Sendable {
     @discardableResult
     public func trackViewProduct(productId: String, name: String, price: Decimal, currency: String = "USD", category: String? = nil) -> SafeResult<Void> {
         guard let core = lockedCore else { return .failure(.notInitialized) }
-        var props: [String: String] = [
+        var props: [String: Any] = [
             "product_id": productId,
             "product_name": name,
-            "price": NSDecimalNumber(decimal: price).stringValue,
+            "price": Self.money(price),
             "currency": currency,
         ]
         if let c = category { props["category"] = c }
@@ -314,9 +338,9 @@ public final class CommerceModule: @unchecked Sendable {
     @discardableResult
     public func trackRefund(transactionId: String, amount: Decimal, currency: String, reason: String? = nil) -> SafeResult<Void> {
         guard let core = lockedCore else { return .failure(.notInitialized) }
-        var props: [String: String] = [
+        var props: [String: Any] = [
             "transaction_id": transactionId,
-            "amount": NSDecimalNumber(decimal: amount).stringValue,
+            "amount": Self.money(amount),
             "currency": currency,
         ]
         if let r = reason { props["reason"] = r }
@@ -402,7 +426,7 @@ public final class CommerceModule: @unchecked Sendable {
     @available(iOS 15.0, macOS 13.0, tvOS 15.0, watchOS 8.0, *)
     static func inAppPurchaseProperties(
         from skTransaction: StoreKit.Transaction
-    ) -> [String: String] {
+    ) -> [String: Any] {
         let currencyCode: String
         if #available(iOS 16.0, macOS 13.0, tvOS 16.0, watchOS 9.0, *) {
             currencyCode = skTransaction.currency?.identifier ?? "USD"
@@ -411,14 +435,14 @@ public final class CommerceModule: @unchecked Sendable {
         }
         let price = skTransaction.price ?? .zero
 
-        var props: [String: String] = [
+        var props: [String: Any] = [
             "transaction_id": String(skTransaction.id),
             "original_transaction_id": String(skTransaction.originalID),
             "product_id": skTransaction.productID,
-            "price": NSDecimalNumber(decimal: price).stringValue,
+            "price": money(price),
             "currency": currencyCode,
-            "quantity": String(skTransaction.purchasedQuantity),
-            "is_upgraded": String(skTransaction.isUpgraded),
+            "quantity": skTransaction.purchasedQuantity,
+            "is_upgraded": skTransaction.isUpgraded,
         ]
         if let groupId = skTransaction.subscriptionGroupID {
             props["subscription_group_id"] = groupId
@@ -468,14 +492,15 @@ public final class CommerceModule: @unchecked Sendable {
         lock.unlock()
 
         let props = Self.inAppPurchaseProperties(from: transaction)
+        let propsJson = Layers.jsonString(from: props)
         do {
             try core.track(
                 eventName: "$in_app_purchase",
-                propertiesJson: Layers.jsonString(from: props),
+                propertiesJson: propsJson,
                 userId: nil,
                 anonymousId: nil
             )
-            skan?.processEvent(eventName: "purchase", properties: props)
+            skan?.processEventJson(eventName: "purchase", propertiesJson: propsJson)
         } catch {
             // Best-effort — auto-capture must never crash the host app.
         }

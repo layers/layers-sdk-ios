@@ -124,9 +124,11 @@ public final class RevenueCatModule: @unchecked Sendable {
         store: String = "app_store"
     ) -> SafeResult<Void> {
         guard let core = lockedCore else { return .failure(.notInitialized) }
-        let props: [String: String] = [
+        let props: [String: Any] = [
             "product_id": productId,
-            "revenue": String(price),
+            // A number, not `String(price)`. This is a revenue field: the
+            // warehouse sums it.
+            "revenue": price,
             "currency": currency,
             "store": store,
             "source": "revenuecat"

@@ -153,6 +153,19 @@ public struct LayersConfig: Sendable {
     /// Whether to automatically capture StoreKit 2 in-app purchases via `Transaction.updates`.
     /// Defaults to `false` for privacy posture — opt in explicitly.
     public let automaticPurchaseTrackingEnabled: Bool
+    /// Whether to install the uncaught-`NSException` handler that turns crashes
+    /// into `$exception` events, and to drain the previous launch's crash record
+    /// on init. Defaults to `true`. A crash is recorded on the launch that crashes
+    /// and emitted on the next one with `$exception_handled = false`. Set to
+    /// `false` when another crash reporter owns the process-wide handlers;
+    /// `Layers.exceptions.captureException` keeps working either way.
+    public let automaticExceptionTrackingEnabled: Bool
+    /// Whether the POSIX signal crash capture (`SIGSEGV`, `SIGABRT`, `SIGBUS`,
+    /// `SIGFPE`, `SIGILL`, `SIGTRAP`) installs its handlers. Defaults to `false`:
+    /// the handler is not yet async-signal-safe, so a heap-corruption crash can
+    /// deadlock inside it instead of crashing. Uncaught `NSException` capture and
+    /// the pending-crash drain do not depend on this flag.
+    public let signalCrashCaptureEnabled: Bool
     /// Optional Tier 4 bootstrap data — pre-evaluated feature flags + payloads
     /// to seed the cache before the first `/config` fetch returns. Critical
     /// for SSR-rendered apps that can't wait on a network round-trip.
@@ -200,6 +213,8 @@ public struct LayersConfig: Sendable {
         automaticLifecycleTrackingEnabled: Bool = true,
         automaticScreenTrackingEnabled: Bool = true,
         automaticPurchaseTrackingEnabled: Bool = false,
+        automaticExceptionTrackingEnabled: Bool = true,
+        signalCrashCaptureEnabled: Bool = false,
         consentRequired: Bool = false,
         attDrivesAdvertisingConsent: Bool = false,
         featureFlagBootstrap: BootstrapData? = nil
@@ -216,6 +231,8 @@ public struct LayersConfig: Sendable {
         self.automaticLifecycleTrackingEnabled = automaticLifecycleTrackingEnabled
         self.automaticScreenTrackingEnabled = automaticScreenTrackingEnabled
         self.automaticPurchaseTrackingEnabled = automaticPurchaseTrackingEnabled
+        self.automaticExceptionTrackingEnabled = automaticExceptionTrackingEnabled
+        self.signalCrashCaptureEnabled = signalCrashCaptureEnabled
         self.consentRequired = consentRequired
         self._legacyATTDrivesAdvertisingConsent = attDrivesAdvertisingConsent
         self.featureFlagBootstrap = featureFlagBootstrap
@@ -477,6 +494,11 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
     /// Auto-capture `$screen_view` from UIKit `viewDidAppear`. Wiring is gated by
     /// `LayersConfig.automaticScreenTrackingEnabled`.
     public let screenTracking = ScreenTrackingModule()
+    /// Tier 5 — crash and exception capture. The process-wide handlers follow
+    /// `LayersConfig.automaticExceptionTrackingEnabled` (and
+    /// `signalCrashCaptureEnabled` for signals); `captureException` works
+    /// whenever the SDK is initialized.
+    public let exceptions = ExceptionModule()
     /// Tier 8 — In-product surveys & messaging (iOS only).
     #if canImport(UIKit)
     // Availability must not exceed the enclosing class (iOS 14/tvOS 14) —
@@ -801,6 +823,15 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
         if config.automaticScreenTrackingEnabled {
             screenTracking.attach(sdk: self)
         }
+        // Tier 5: the emitter is always wired so captureException works; the
+        // process-wide handlers (installed once) and the drain of a previous
+        // launch's crash record follow the flags.
+        exceptions.attach(
+            sdk: self,
+            persistenceDir: persistencePath,
+            automaticCapture: config.automaticExceptionTrackingEnabled,
+            captureSignals: config.signalCrashCaptureEnabled
+        )
         #if canImport(StoreKit)
         if config.automaticPurchaseTrackingEnabled {
             if #available(iOS 15.0, macOS 13.0, tvOS 15.0, watchOS 8.0, *) {
@@ -2178,6 +2209,9 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
         if enableDebug {
             os_log("shutdown()", log: Self.log, type: .debug)
         }
+        // The exception module holds no core state; detach it first so a
+        // failed core shutdown cannot leave its emitter pointing at this run.
+        exceptions.detach()
         do {
             try core.shutdown()
 
@@ -2956,19 +2990,95 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
         return str
     }
 
+    /// How deep a property value may nest before it is replaced by null.
+    /// Nothing legitimate goes near this; it bounds the recursion below.
+    private static let maxPropertyDepth = 32
+
+    /// Coerce one property value into something `JSONSerialization` accepts,
+    /// keeping its JSON type wherever there is one.
+    ///
+    /// `JSONSerialization.isValidJSONObject` is all-or-nothing, so before this
+    /// existed a SINGLE unencodable value — a `Date`, a `URL`, a custom struct,
+    /// a `Double.nan` — made `jsonString(from:)` return nil and the caller
+    /// dropped the ENTIRE property bag. One `Date` in a ten-key dictionary
+    /// silently cost all ten keys, and the only trace was an os_log line on the
+    /// device. Losing one property's fidelity beats losing every property.
+    ///
+    /// `Date` and `URL` get real encodings rather than `String(describing:)`
+    /// because both have a canonical one and both are common in a property bag.
+    static func sanitizeJSONValue(
+        _ value: Any,
+        depth: Int = 0,
+        formatter: ISO8601DateFormatter? = nil
+    ) -> Any {
+        if depth >= maxPropertyDepth { return NSNull() }
+
+        let dateFormatter = formatter ?? isoFormatter()
+
+        switch value {
+        case is NSNull:
+            return value
+
+        case let string as String:
+            return string
+
+        case let url as URL:
+            return url.absoluteString
+
+        case let date as Date:
+            return dateFormatter.string(from: date)
+
+        case let number as NSNumber:
+            // Bool, every integer width, Double, Float and Decimal all bridge
+            // to NSNumber, so this one case keeps all of them typed.
+            // CFBoolean is what a JSON boolean must stay.
+            if CFGetTypeID(number) == CFBooleanGetTypeID() { return number }
+            // JSON has no NaN or Infinity, and JSONSerialization rejects the
+            // whole object rather than the one value.
+            return number.doubleValue.isFinite ? number : NSNull()
+
+        case let array as [Any]:
+            return array.map { sanitizeJSONValue($0, depth: depth + 1, formatter: dateFormatter) }
+
+        case let nested as [String: Any]:
+            var out = [String: Any](minimumCapacity: nested.count)
+            for (key, element) in nested {
+                out[key] = sanitizeJSONValue(element, depth: depth + 1, formatter: dateFormatter)
+            }
+            return out
+
+        case let nested as [AnyHashable: Any]:
+            // JSON object keys are strings.
+            var out = [String: Any](minimumCapacity: nested.count)
+            for (key, element) in nested {
+                out["\(key)"] = sanitizeJSONValue(element, depth: depth + 1, formatter: dateFormatter)
+            }
+            return out
+
+        default:
+            return String(describing: value)
+        }
+    }
+
+    private static func isoFormatter() -> ISO8601DateFormatter {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }
+
     static func jsonString(from dict: [String: Any]) -> String? {
         if dict.isEmpty { return nil }
-        guard JSONSerialization.isValidJSONObject(dict) else {
-            os_log(
-                "Properties dropped: could not serialize to JSON. Keys: %{public}@",
-                log: Self.log,
-                type: .error,
-                dict.keys.sorted().joined(separator: ", ")
-            )
-            return nil
+
+        let formatter = isoFormatter()
+        var sanitized = [String: Any](minimumCapacity: dict.count)
+        for (key, value) in dict {
+            sanitized[key] = sanitizeJSONValue(value, depth: 0, formatter: formatter)
         }
-        guard let data = try? JSONSerialization.data(withJSONObject: dict, options: [.sortedKeys]),
-              let str = String(data: data, encoding: .utf8) else {
+
+        guard JSONSerialization.isValidJSONObject(sanitized),
+              let data = try? JSONSerialization.data(withJSONObject: sanitized, options: [.sortedKeys]),
+              let str = String(data: data, encoding: .utf8)
+        else {
             os_log(
                 "Properties dropped: could not serialize to JSON. Keys: %{public}@",
                 log: Self.log,
@@ -3229,7 +3339,7 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
     /// The Swift wrapper's own version, reported as `swift/<version>` in
     /// `X-SDK-Version`. Kept in lockstep with the rest of the repo by
     /// scripts/check-versions.sh.
-    static let sdkVersion = "3.3.0"
+    static let sdkVersion = "3.3.1"
 
     /// Return the SDK version string.
     ///
