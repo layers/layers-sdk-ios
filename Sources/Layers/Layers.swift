@@ -642,6 +642,11 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
         // Main thread init complete — record timing
         let mainThreadDurationMs = (CFAbsoluteTimeGetCurrent() - initStartTime) * 1000.0
 
+        // Opened BEFORE `_isInitialized` flips, so a resolveDeferredDeepLink
+        // call that sees an initialized SDK always finds this run's config
+        // fetch pending rather than a stale "settled" from an earlier run.
+        let initConfigToken = beginInitConfigFetch()
+
         lock.lock()
         _core = handle
         _anonymousId = _anonymousId ?? UUID().uuidString
@@ -729,6 +734,11 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
             // used below to detect whether the fetch changed anything.
             let bootstrapSnapshot = self.getAllFlags()
             self.fetchRemoteConfigSync(timeoutSecs: 2.0)
+            // Whatever the fetch did (landed, failed, timed out), the config
+            // this run will ever see at init is now cached. Release anyone
+            // waiting on it — before the generation guard below, so a stale
+            // run cannot strand a waiter.
+            self.markInitConfigFetchSettled(token: initConfigToken)
 
             // The host may have shut the SDK down (or shut down AND
             // re-initialized) while the fetch ran. Re-resolve the core and
@@ -1157,6 +1167,318 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
             self._featureFlagListenersFired.remove(id)
             self.lock.unlock()
         }
+    }
+
+    // MARK: - Deferred Deep Links
+
+    /// UserDefaults key holding this install's deferred deep link and whether
+    /// it has been delivered.
+    static let deferredDeepLinkKey = "com.layers.deferredDeepLink"
+    /// Set once a `/clicks/resolve` probe has gone out, so
+    /// ``resolveDeferredDeepLink(completion:)`` never sends a second one.
+    static let deferredClickResolveAttemptedKey = "com.layers.deferredClickResolveAttempted"
+
+    private let deferredLock = NSLock()
+    /// Serialises ``resolveDeferredDeepLink(completion:)``: overlapping calls
+    /// queue behind the one in flight, and each finds what it settled (the
+    /// link, or the one-shot probe already spent) instead of racing it.
+    private let deferredResolveQueue = DispatchQueue(
+        label: "com.layers.deferred-deeplink-resolve", qos: .utility
+    )
+    /// The init-time `/config` fetch, as a waitable fact. `initialize` returns
+    /// before that fetch runs, and the remote-config cache is empty until it
+    /// lands — so a resolve called straight after `initialize` must wait for
+    /// it rather than read "no config" as the server's answer.
+    private let initConfigCondition = NSCondition()
+    private var _initConfigToken: UInt64 = 0
+    private var _initConfigSettled = true
+    /// Upper bound on that wait. The fetch itself is capped at 2s.
+    static let initConfigWaitTimeout: TimeInterval = 5.0
+    private var _deferredDeepLink: DeferredDeepLink?
+    private var _deferredDeepLinkDelivered = false
+    private var _deferredDeepLinkRestored = false
+    private var _deferredDeepLinkListeners: [Int: (DeferredDeepLink) -> Void] = [:]
+    private var _deferredDeepLinkListenerNextId = 0
+    /// The install date ``resolveDeferredDeepLink(completion:)`` judges
+    /// freshness by. A seam for tests: the real value is the host's Documents
+    /// directory creation date, which on a dev machine is usually days old.
+    var deferredInstallDateProvider: () -> Date? = { Layers.appInstallDate() }
+
+    /// The deferred deep link for this install — the payload of the Layers
+    /// tracking link (`in.layers.com/l/tlnk_…`) the user tapped before
+    /// installing — or nil.
+    ///
+    /// One-shot per install: the first call (or ``onDeferredDeepLink(_:)``
+    /// listener) that receives it marks it delivered, persistently, and every
+    /// later call on this install returns nil. A link found and not yet taken
+    /// stays pending across launches.
+    ///
+    /// On Apple platforms the only source today is `POST /clicks/resolve`,
+    /// which runs only where the server's `fingerprint_resolve_enabled` remote
+    /// config is `true` (default OFF) and consent allows it. Prefer
+    /// ``onDeferredDeepLink(_:)``: the probe completes after `initialize`
+    /// returns.
+    public func getDeferredDeepLink() -> DeferredDeepLink? {
+        deferredLock.lock()
+        restoreDeferredDeepLinkLocked()
+        guard let link = _deferredDeepLink, !_deferredDeepLinkDelivered else {
+            deferredLock.unlock()
+            return nil
+        }
+        _deferredDeepLinkDelivered = true
+        persistDeferredDeepLinkLocked()
+        deferredLock.unlock()
+        return link
+    }
+
+    /// Call `callback` once, on the main queue, when this install's deferred
+    /// deep link becomes known — straight away if it was already known and not
+    /// yet delivered when you subscribed. Fires at most once per install across
+    /// every listener and ``getDeferredDeepLink()``.
+    ///
+    /// - Returns: an unsubscribe closure.
+    @discardableResult
+    public func onDeferredDeepLink(_ callback: @escaping (DeferredDeepLink) -> Void) -> () -> Void {
+        deferredLock.lock()
+        restoreDeferredDeepLinkLocked()
+        _deferredDeepLinkListenerNextId &+= 1
+        let id = _deferredDeepLinkListenerNextId
+        _deferredDeepLinkListeners[id] = callback
+        deferredLock.unlock()
+
+        deliverDeferredDeepLinkToListeners()
+
+        return { [weak self] in
+            guard let self = self else { return }
+            self.deferredLock.lock()
+            self._deferredDeepLinkListeners.removeValue(forKey: id)
+            self.deferredLock.unlock()
+        }
+    }
+
+    /// Look for this install's deferred deep link, then hand it to
+    /// `completion` (on the main queue) the way ``getDeferredDeepLink()``
+    /// returns it, consuming it.
+    ///
+    /// `initialize` already runs this lookup when `autoTrackAppOpen` is on (the
+    /// default). Apps that turn `autoTrackAppOpen` off call this after
+    /// `initialize`. It sends `POST /clicks/resolve` only where every existing
+    /// gate allows it — the server's `fingerprint_resolve_enabled` is `true`
+    /// (default OFF; the probe sends device signals, so App Store Review
+    /// Guideline 5.1.2 applies), the core's consent / DNT / Retry-After /
+    /// circuit-breaker gate is open, no click id is already known, the install
+    /// is under 24 hours old, and no probe has gone out for this install
+    /// before. This method opens none of those gates.
+    public func resolveDeferredDeepLink(completion: @escaping (DeferredDeepLink?) -> Void) {
+        deferredResolveQueue.async { [weak self] in
+            guard let self = self else {
+                DispatchQueue.main.async { completion(nil) }
+                return
+            }
+            self.runDeferredDeepLinkResolve()
+            let link = self.getDeferredDeepLink()
+            DispatchQueue.main.async { completion(link) }
+        }
+    }
+
+    /// Async form of ``resolveDeferredDeepLink(completion:)``.
+    public func resolveDeferredDeepLink() async -> DeferredDeepLink? {
+        await withCheckedContinuation { continuation in
+            resolveDeferredDeepLink { continuation.resume(returning: $0) }
+        }
+    }
+
+    /// Whether ``resolveDeferredDeepLink(completion:)`` may send the probe.
+    ///
+    /// Pure and static so the whole policy is one testable expression. The
+    /// delivery half (consent / DNT / Retry-After / breaker) is applied inside
+    /// `resolveClickFromFingerprintBlocking`, as for the automatic path.
+    ///
+    /// Freshness is judged by install date alone, deliberately: with
+    /// `autoTrackAppOpen` off nothing else records a first launch, and an app
+    /// upgrading into this SDK must not count as a new install.
+    static func deferredClickResolveAllowed(
+        remoteConfigEnabled: Bool,
+        alreadyAttempted: Bool,
+        firstLaunchTracked: Bool,
+        hasExistingAttribution: Bool,
+        installDate: Date?,
+        now: Date = Date()
+    ) -> Bool {
+        guard remoteConfigEnabled, !alreadyAttempted, !firstLaunchTracked,
+              !hasExistingAttribution else { return false }
+        guard let installDate = installDate else { return true }
+        return now.timeIntervalSince(installDate) <= installEventMaxDiffSecs
+    }
+
+    /// Mark this run's init-time config fetch as pending. Returns its token.
+    func beginInitConfigFetch() -> UInt64 {
+        initConfigCondition.lock()
+        defer { initConfigCondition.unlock() }
+        _initConfigToken &+= 1
+        _initConfigSettled = false
+        return _initConfigToken
+    }
+
+    /// The fetch for `token` is over. A token from a superseded run is ignored.
+    func markInitConfigFetchSettled(token: UInt64) {
+        initConfigCondition.lock()
+        if token == _initConfigToken {
+            _initConfigSettled = true
+            initConfigCondition.broadcast()
+        }
+        initConfigCondition.unlock()
+    }
+
+    /// shutdown(): nothing will settle the pending fetch, so release waiters.
+    private func releaseInitConfigWaiters() {
+        initConfigCondition.lock()
+        _initConfigSettled = true
+        initConfigCondition.broadcast()
+        initConfigCondition.unlock()
+    }
+
+    /// Block (off the main thread) until the init-time config fetch has
+    /// settled or `timeout` passes. Returns whether it settled. A timeout is
+    /// not an answer: the caller then reads whatever is cached, and an empty
+    /// cache keeps the probe off — unknown is off.
+    @discardableResult
+    func waitForInitConfigFetch(timeout: TimeInterval) -> Bool {
+        initConfigCondition.lock()
+        defer { initConfigCondition.unlock() }
+        let deadline = Date().addingTimeInterval(timeout)
+        while !_initConfigSettled {
+            if !initConfigCondition.wait(until: deadline) { break }
+        }
+        return _initConfigSettled
+    }
+
+    /// Claim this install's single `/clicks/resolve` probe. Atomic across
+    /// every caller (the automatic first-launch path and
+    /// resolveDeferredDeepLink): exactly one ever gets `true`, and the claim
+    /// is persisted before the request so a timeout or a kill mid-flight
+    /// cannot earn the install a second fingerprint.
+    func claimClickResolveProbe() -> Bool {
+        deferredLock.lock()
+        defer { deferredLock.unlock() }
+        let defaults = UserDefaults.standard
+        if defaults.bool(forKey: Self.deferredClickResolveAttemptedKey) { return false }
+        defaults.set(true, forKey: Self.deferredClickResolveAttemptedKey)
+        return true
+    }
+
+    private func runDeferredDeepLinkResolve() {
+        // Before anything that reads the config: an `initialize` that has just
+        // returned has not fetched it yet.
+        waitForInitConfigFetch(timeout: Self.initConfigWaitTimeout)
+        guard let core = lockedCoreIfInitialized() else {
+            if enableDebug {
+                os_log("resolveDeferredDeepLink: call initialize first", log: Self.log, type: .debug)
+            }
+            return
+        }
+        deferredLock.lock()
+        restoreDeferredDeepLinkLocked()
+        let settled = _deferredDeepLink != nil || _deferredDeepLinkDelivered
+        deferredLock.unlock()
+        if settled { return }
+
+        var remoteConfigEnabled = false
+        if let configJson = try? core.getRemoteConfigJson(),
+           let data = configJson.data(using: .utf8),
+           let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            // `as? Bool`: a truthy non-boolean leaves the gate shut.
+            remoteConfigEnabled = parsed["fingerprint_resolve_enabled"] as? Bool ?? false
+        }
+        let hasExistingAttribution: Bool = {
+            lock.lock()
+            defer { lock.unlock() }
+            return _attributionFbclid != nil
+                || _attributionGclid != nil
+                || _attributionTtclid != nil
+                || _attributionMsclkid != nil
+        }()
+        let defaults = UserDefaults.standard
+        let allowed = Self.deferredClickResolveAllowed(
+            remoteConfigEnabled: remoteConfigEnabled,
+            alreadyAttempted: defaults.bool(forKey: Self.deferredClickResolveAttemptedKey),
+            firstLaunchTracked: defaults.bool(forKey: Self.firstLaunchTrackedKey),
+            hasExistingAttribution: hasExistingAttribution,
+            installDate: deferredInstallDateProvider()
+        )
+        guard allowed else { return }
+        resolveClickFromFingerprintBlocking(timeout: 3.0, enabled: remoteConfigEnabled)
+    }
+
+    /// Load the persisted record once per process. Caller holds `deferredLock`.
+    private func restoreDeferredDeepLinkLocked() {
+        guard !_deferredDeepLinkRestored else { return }
+        _deferredDeepLinkRestored = true
+        guard let dict = UserDefaults.standard.dictionary(forKey: Self.deferredDeepLinkKey) else {
+            return
+        }
+        let restored = DeferredDeepLink.fromStorage(dict)
+        if restored.delivered { _deferredDeepLinkDelivered = true }
+        if _deferredDeepLink == nil { _deferredDeepLink = restored.link }
+    }
+
+    /// Caller holds `deferredLock`.
+    private func persistDeferredDeepLinkLocked() {
+        var dict: [String: Any] = ["delivered": _deferredDeepLinkDelivered]
+        if let link = _deferredDeepLink {
+            dict = link.storageDictionary(delivered: _deferredDeepLinkDelivered)
+        }
+        UserDefaults.standard.set(dict, forKey: Self.deferredDeepLinkKey)
+    }
+
+    /// Keep the first deferred deep link this install finds. A later one never
+    /// replaces it, and an install that already delivered one records nothing.
+    func recordDeferredDeepLink(_ link: DeferredDeepLink) {
+        deferredLock.lock()
+        restoreDeferredDeepLinkLocked()
+        guard _deferredDeepLink == nil, !_deferredDeepLinkDelivered else {
+            deferredLock.unlock()
+            return
+        }
+        _deferredDeepLink = link
+        persistDeferredDeepLinkLocked()
+        deferredLock.unlock()
+        if enableDebug {
+            // Keys only: the payload is the app's own data and stays out of logs.
+            os_log(
+                "deferred deep link found source=%{public}@ keys=%d",
+                log: Self.log, type: .debug,
+                link.source.rawValue, link.payload.count
+            )
+        }
+        deliverDeferredDeepLinkToListeners()
+    }
+
+    private func deliverDeferredDeepLinkToListeners() {
+        deferredLock.lock()
+        guard let link = _deferredDeepLink, !_deferredDeepLinkDelivered,
+              !_deferredDeepLinkListeners.isEmpty else {
+            deferredLock.unlock()
+            return
+        }
+        _deferredDeepLinkDelivered = true
+        persistDeferredDeepLinkLocked()
+        let listeners = Array(_deferredDeepLinkListeners.values)
+        deferredLock.unlock()
+        DispatchQueue.main.async {
+            for listener in listeners { listener(link) }
+        }
+    }
+
+    /// Test hook: forget the in-memory deferred-deep-link state so the next
+    /// access re-reads UserDefaults, as a fresh launch would.
+    func resetDeferredDeepLinkStateForTesting() {
+        deferredLock.lock()
+        _deferredDeepLink = nil
+        _deferredDeepLinkDelivered = false
+        _deferredDeepLinkRestored = false
+        _deferredDeepLinkListeners.removeAll()
+        deferredLock.unlock()
     }
 
     // MARK: - Internal Feature-Flag Helpers
@@ -2248,6 +2570,8 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
             // (Delivery-policy state — Retry-After gate, circuit breaker —
             // lives in the Rust core and dies with the handle below.)
 
+            releaseInitConfigWaiters()
+
             lock.lock()
             _core = nil
             _isInitialized = false
@@ -3224,6 +3548,20 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
             return
         }
 
+        // One probe per install, whichever path sends it (the automatic
+        // first-launch branch or resolveDeferredDeepLink). Claimed after the
+        // delivery gate, so a consent denial does not spend it.
+        guard claimClickResolveProbe() else {
+            if enableDebug {
+                os_log(
+                    "clicks/resolve skipped — this install already sent its one probe",
+                    log: Self.log,
+                    type: .debug
+                )
+            }
+            return
+        }
+
         lock.lock()
         let appId = _configAppId
         let baseUrlConfig = _configBaseUrl
@@ -3288,6 +3626,17 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
                 let ttclid = dataDict["ttclid"] as? String
                 let msclkid = dataDict["msclkid"] as? String
 
+                // A match that carries only a tracking-link payload is still
+                // worth keeping: the server returns `deeplink` for `/l/` clicks
+                // (never for `/c/`, whose payload came off a query string
+                // anyone could type), with or without network click ids.
+                if let payload = DeferredDeepLink.normalizePayload(dataDict["deeplink"]) {
+                    let clickId = (dataDict["click_id"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+                    self.recordDeferredDeepLink(
+                        DeferredDeepLink(payload: payload, source: .clickResolve, clickId: clickId)
+                    )
+                }
+
                 guard fbclid != nil || gclid != nil || ttclid != nil || msclkid != nil else { return }
 
                 // Merge with existing state so we don't clobber prior values.
@@ -3339,7 +3688,7 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
     /// The Swift wrapper's own version, reported as `swift/<version>` in
     /// `X-SDK-Version`. Kept in lockstep with the rest of the repo by
     /// scripts/check-versions.sh.
-    static let sdkVersion = "3.3.4"
+    static let sdkVersion = "3.4.0"
 
     /// Return the SDK version string.
     ///
