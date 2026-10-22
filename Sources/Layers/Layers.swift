@@ -138,6 +138,9 @@ public struct LayersConfig: Sendable {
     public let maxQueueSize: UInt32
     /// Custom base URL for the ingest API. Defaults to the Layers production endpoint.
     public let baseUrl: String?
+    /// Host for ATT-authorized batches that carry the IDFA. Defaults to https://att.layers.com.
+    /// Overriding `baseUrl` leaves this host unchanged. Point both at a mock server or proxy.
+    public let trackingBaseUrl: String?
     /// Whether to automatically fire an `app_open` event during initialization.
     /// Set to `false` if you want to fire the event manually. Defaults to `true`.
     public let autoTrackAppOpen: Bool
@@ -209,6 +212,7 @@ public struct LayersConfig: Sendable {
         flushIntervalSecs: UInt32 = 30,
         maxQueueSize: UInt32 = 10000,
         baseUrl: String? = nil,
+        trackingBaseUrl: String? = nil,
         autoTrackAppOpen: Bool = true,
         automaticLifecycleTrackingEnabled: Bool = true,
         automaticScreenTrackingEnabled: Bool = true,
@@ -227,6 +231,7 @@ public struct LayersConfig: Sendable {
         self.flushIntervalSecs = flushIntervalSecs
         self.maxQueueSize = maxQueueSize
         self.baseUrl = baseUrl
+        self.trackingBaseUrl = trackingBaseUrl
         self.autoTrackAppOpen = autoTrackAppOpen
         self.automaticLifecycleTrackingEnabled = automaticLifecycleTrackingEnabled
         self.automaticScreenTrackingEnabled = automaticScreenTrackingEnabled
@@ -561,6 +566,7 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
             appId: config.appId,
             environment: config.environment,
             baseUrl: config.baseUrl,
+            trackingBaseUrl: config.trackingBaseUrl,
             flushIntervalMs: UInt64(config.flushIntervalSecs) * 1000,
             flushThreshold: config.flushQueueSize,
             maxQueueSize: config.maxQueueSize,
@@ -2369,13 +2375,16 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
         // so neither success nor failure is true).
 
         // Drain a batch from the Rust queue
-        let batchJson: String
+        let delivery: UniFfiDeliveryBatch
         do {
-            guard let json = try core.drainBatch(count: Self.defaultBatchSize) else {
+            guard let batch = try core.drainDeliveryBatch(
+                count: Self.defaultBatchSize,
+                attStatus: att.getStatus().rawValue
+            ) else {
                 core.abortFlushAttempt()
                 return .success(()) // Queue raced empty
             }
-            batchJson = json
+            delivery = batch
         } catch {
             core.abortFlushAttempt()
             let mapped = Self.mapError(error)
@@ -2383,14 +2392,14 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
             return .failure(mapped)
         }
 
-        // Get URL and headers from the Rust core
-        let urlString: String
+        let batchJson = delivery.body
+        let urlString = delivery.url
+        // Get headers from the Rust core
         let headersJson: String
         do {
-            urlString = try core.eventsUrl()
             headersJson = try core.flushHeadersJson()
         } catch {
-            // Cannot deliver without URL/headers — requeue events
+            // Requeue events when headers are unavailable.
             core.abortFlushAttempt()
             requeueSilently(core: core, batchJson: batchJson)
             let mapped = Self.mapError(error)
@@ -3688,7 +3697,7 @@ public final class Layers: @unchecked Sendable, LayersProtocol {
     /// The Swift wrapper's own version, reported as `swift/<version>` in
     /// `X-SDK-Version`. Kept in lockstep with the rest of the repo by
     /// scripts/check-versions.sh.
-    static let sdkVersion = "3.4.1"
+    static let sdkVersion = "3.5.0"
 
     /// Return the SDK version string.
     ///

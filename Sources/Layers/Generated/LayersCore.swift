@@ -625,6 +625,12 @@ public protocol LayersCoreHandleProtocol: AnyObject {
     func drainBatch(count: UInt32) throws -> String?
 
     /**
+     * Drain a batch and its delivery URL. iOS wrappers pass the live ATT
+     * status read at this drain; Android passes `None`.
+     */
+    func drainDeliveryBatch(count: UInt32, attStatus: String?) throws -> UniFfiDeliveryBatch?
+
+    /**
      * Return the full URL for the events ingest endpoint.
      */
     func eventsUrl() throws -> String
@@ -1278,6 +1284,18 @@ open class LayersCoreHandle:
         return try FfiConverterOptionString.lift(rustCallWithError(FfiConverterTypeUniFFIError.lift) {
             uniffi_layers_core_fn_method_layerscorehandle_drain_batch(self.uniffiClonePointer(),
                                                                       FfiConverterUInt32.lower(count), $0)
+        })
+    }
+
+    /**
+     * Drain a batch and its delivery URL. iOS wrappers pass the live ATT
+     * status read at this drain; Android passes `None`.
+     */
+    open func drainDeliveryBatch(count: UInt32, attStatus: String?) throws -> UniFfiDeliveryBatch? {
+        return try FfiConverterOptionTypeUniFFIDeliveryBatch.lift(rustCallWithError(FfiConverterTypeUniFFIError.lift) {
+            uniffi_layers_core_fn_method_layerscorehandle_drain_delivery_batch(self.uniffiClonePointer(),
+                                                                               FfiConverterUInt32.lower(count),
+                                                                               FfiConverterOptionString.lower(attStatus), $0)
         })
     }
 
@@ -2205,6 +2223,10 @@ public struct UniFfiConfig {
     public let appId: String
     public let environment: LayersEnvironment
     public let baseUrl: String?
+    /**
+     * Host for consented, IDFA-bearing iOS batches. Defaults to https://att.layers.com.
+     */
+    public let trackingBaseUrl: String?
     public let flushIntervalMs: UInt64?
     public let flushThreshold: UInt32?
     public let maxQueueSize: UInt32?
@@ -2239,7 +2261,10 @@ public struct UniFfiConfig {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(appId: String, environment: LayersEnvironment, baseUrl: String?, flushIntervalMs: UInt64?, flushThreshold: UInt32?, maxQueueSize: UInt32?, maxBatchSize: UInt32?, enableDebug: Bool?,
+    public init(appId: String, environment: LayersEnvironment, baseUrl: String?,
+                /**
+                    * Host for consented, IDFA-bearing iOS batches. Defaults to https://att.layers.com.
+                    */ trackingBaseUrl: String?, flushIntervalMs: UInt64?, flushThreshold: UInt32?, maxQueueSize: UInt32?, maxBatchSize: UInt32?, enableDebug: Bool?,
                 /**
                     * Enable per-device DebugView. When true, the SDK mints + persists a
                     * stable UUID and sends it in the `X-Debug-Token` header on every
@@ -2264,6 +2289,7 @@ public struct UniFfiConfig {
         self.appId = appId
         self.environment = environment
         self.baseUrl = baseUrl
+        self.trackingBaseUrl = trackingBaseUrl
         self.flushIntervalMs = flushIntervalMs
         self.flushThreshold = flushThreshold
         self.maxQueueSize = maxQueueSize
@@ -2287,6 +2313,9 @@ extension UniFfiConfig: Equatable, Hashable {
             return false
         }
         if lhs.baseUrl != rhs.baseUrl {
+            return false
+        }
+        if lhs.trackingBaseUrl != rhs.trackingBaseUrl {
             return false
         }
         if lhs.flushIntervalMs != rhs.flushIntervalMs {
@@ -2329,6 +2358,7 @@ extension UniFfiConfig: Equatable, Hashable {
         hasher.combine(appId)
         hasher.combine(environment)
         hasher.combine(baseUrl)
+        hasher.combine(trackingBaseUrl)
         hasher.combine(flushIntervalMs)
         hasher.combine(flushThreshold)
         hasher.combine(maxQueueSize)
@@ -2353,6 +2383,7 @@ public struct FfiConverterTypeUniFFIConfig: FfiConverterRustBuffer {
                 appId: FfiConverterString.read(from: &buf),
                 environment: FfiConverterTypeLayersEnvironment.read(from: &buf),
                 baseUrl: FfiConverterOptionString.read(from: &buf),
+                trackingBaseUrl: FfiConverterOptionString.read(from: &buf),
                 flushIntervalMs: FfiConverterOptionUInt64.read(from: &buf),
                 flushThreshold: FfiConverterOptionUInt32.read(from: &buf),
                 maxQueueSize: FfiConverterOptionUInt32.read(from: &buf),
@@ -2371,6 +2402,7 @@ public struct FfiConverterTypeUniFFIConfig: FfiConverterRustBuffer {
         FfiConverterString.write(value.appId, into: &buf)
         FfiConverterTypeLayersEnvironment.write(value.environment, into: &buf)
         FfiConverterOptionString.write(value.baseUrl, into: &buf)
+        FfiConverterOptionString.write(value.trackingBaseUrl, into: &buf)
         FfiConverterOptionUInt64.write(value.flushIntervalMs, into: &buf)
         FfiConverterOptionUInt32.write(value.flushThreshold, into: &buf)
         FfiConverterOptionUInt32.write(value.maxQueueSize, into: &buf)
@@ -2538,6 +2570,70 @@ public func FfiConverterTypeUniFFIConsent_lift(_ buf: RustBuffer) throws -> UniF
 #endif
 public func FfiConverterTypeUniFFIConsent_lower(_ value: UniFfiConsent) -> RustBuffer {
     return FfiConverterTypeUniFFIConsent.lower(value)
+}
+
+/**
+ * A drained batch and the URL to POST it to (see `LayersCore::drain_delivery_batch`).
+ */
+public struct UniFfiDeliveryBatch {
+    public let url: String
+    public let body: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(url: String, body: String) {
+        self.url = url
+        self.body = body
+    }
+}
+
+extension UniFfiDeliveryBatch: Equatable, Hashable {
+    public static func == (lhs: UniFfiDeliveryBatch, rhs: UniFfiDeliveryBatch) -> Bool {
+        if lhs.url != rhs.url {
+            return false
+        }
+        if lhs.body != rhs.body {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(url)
+        hasher.combine(body)
+    }
+}
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeUniFFIDeliveryBatch: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UniFfiDeliveryBatch {
+        return
+            try UniFfiDeliveryBatch(
+                url: FfiConverterString.read(from: &buf),
+                body: FfiConverterString.read(from: &buf)
+            )
+    }
+
+    public static func write(_ value: UniFfiDeliveryBatch, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.url, into: &buf)
+        FfiConverterString.write(value.body, into: &buf)
+    }
+}
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+public func FfiConverterTypeUniFFIDeliveryBatch_lift(_ buf: RustBuffer) throws -> UniFfiDeliveryBatch {
+    return try FfiConverterTypeUniFFIDeliveryBatch.lift(buf)
+}
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+public func FfiConverterTypeUniFFIDeliveryBatch_lower(_ value: UniFfiDeliveryBatch) -> RustBuffer {
+    return FfiConverterTypeUniFFIDeliveryBatch.lower(value)
 }
 
 /**
@@ -3320,6 +3416,30 @@ private struct FfiConverterOptionTypeSkanConversionUpdate: FfiConverterRustBuffe
 #if swift(>=5.8)
     @_documentation(visibility: private)
 #endif
+private struct FfiConverterOptionTypeUniFFIDeliveryBatch: FfiConverterRustBuffer {
+    typealias SwiftType = UniFfiDeliveryBatch?
+
+    static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeUniFFIDeliveryBatch.write(value, into: &buf)
+    }
+
+    static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeUniFFIDeliveryBatch.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
 private struct FfiConverterOptionTypeUniFFIPlatform: FfiConverterRustBuffer {
     typealias SwiftType = UniFfiPlatform?
 
@@ -3416,6 +3536,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if uniffi_layers_core_checksum_method_layerscorehandle_drain_batch() != 55938 {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if uniffi_layers_core_checksum_method_layerscorehandle_drain_delivery_batch() != 56455 {
         return InitializationResult.apiChecksumMismatch
     }
     if uniffi_layers_core_checksum_method_layerscorehandle_events_url() != 60400 {
